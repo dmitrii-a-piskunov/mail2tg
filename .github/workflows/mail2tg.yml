@@ -64,5 +64,16 @@ jobs:
           [ -f state.json ] && git add state.json
           if ! git diff --cached --quiet; then
             git commit -m "Обновление состояния" --quiet
-            git push --quiet
+            # если за время запуска в репозиторий что-то отправили (например, новую
+            # версию кода), сначала подтягиваем изменения, потом сохраняем; при
+            # конфликте в state.json побеждает версия бота
+            for attempt in 1 2 3 4 5; do
+              if git pull --rebase -X theirs --quiet && git push --quiet; then
+                exit 0
+              fi
+              git rebase --abort 2>/dev/null || true
+              sleep $((attempt * 5))
+            done
+            echo "Не удалось сохранить состояние"
+            exit 1
           fi
