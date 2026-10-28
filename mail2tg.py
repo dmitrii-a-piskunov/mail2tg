@@ -18,8 +18,8 @@
   IMAP_FOLDER    — по умолчанию INBOX
   TZ_NAME        — часовой пояс для даты письма, по умолчанию Europe/Samara
   MAX_PER_RUN    — сколько писем максимум за один запуск, по умолчанию 20
-  SCREENSHOTS    — картинка письма: auto (только письма с таблицами, по умолчанию),
-                   always (всегда) или off (никогда)
+  SCREENSHOTS    — картинка письма: always (для всех писем, по умолчанию),
+                   auto (только письма с таблицами) или off (никогда)
   BACKFILL_SINCE — дата (2026-09-01 или 01.09.2026): переслать все письма,
                    пришедшие начиная с этого дня. Задаётся при ручном запуске.
 
@@ -70,8 +70,8 @@ TG_CHAT_ID = env("TG_CHAT_ID")
 TZ = ZoneInfo(env("TZ_NAME", "Europe/Samara"))
 MAX_PER_RUN = int(env("MAX_PER_RUN", required=False) or "20")
 BACKFILL_SINCE = (os.environ.get("BACKFILL_SINCE") or "").strip()
-# Скриншот письма: auto — только для писем с таблицами, always — всегда, off — никогда
-SCREENSHOTS = (os.environ.get("SCREENSHOTS") or "auto").strip().lower()
+# Скриншот письма: always — для всех писем, auto — только с таблицами, off — никогда
+SCREENSHOTS = (os.environ.get("SCREENSHOTS") or "always").strip().lower()
 
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 
@@ -130,41 +130,169 @@ def send_file(filename, content, reply_to=None):
 # Невидимые символы, которыми рассылки делают отступы и прячут «прехедер»
 INVISIBLE_RE = re.compile("[­͏؜ᅟᅠ឴឵᠎"
                           "​-‏‪-‮⁠-⁯⠀ㅤ﻿ﾠ]")
-SKIP_TAGS = {"script", "style", "head", "title"}
-BLOCK_TAGS = {"br", "p", "div", "tr", "table", "h1", "h2", "h3", "h4", "h5", "h6",
-              "blockquote", "ul", "ol", "section", "header", "footer", "center", "hr"}
 
 
 def strip_invisible(text):
     return INVISIBLE_RE.sub("", text.replace("\xa0", " "))
 
 
-ROW_SEP = "────────"     # разделитель между строками таблицы
-ROW_MAX_LEN = 300       # строки длиннее считаем вёрсткой, а не таблицей с данными
+# Как устроен разбор HTML.
+#
+# Парсер выдаёт один длинный текст, в котором кроме обычного (уже экранированного)
+# текста есть служебные метки:
+#   \x01+b\x01 … \x01-b\x01      — начало/конец жирного (b, i, u, s, ссылка a)
+#   отдельная строка \x02P       — граница абзаца (пустая строка)
+#   отдельная строка \x02R       — разделитель строк таблицы
+#   \x02Q+ / \x02Q-              — начало/конец цитаты
+#   \x02E+ / \x02E-              — начало/конец моноширинного блока <pre>
+# Затем render_marked() превращает это в список записей (текст, вид, цитата),
+# закрывая и заново открывая теги на каждой строке, чтобы разметка всегда
+# была корректной для Telegram — даже когда письмо режется на части.
+
+PARA, ROWSEP = "\n\x02P\n", "\n\x02R\n"
+Q_OPEN, Q_CLOSE = "\n\x02Q+\n", "\n\x02Q-\n"
+PRE_OPEN, PRE_CLOSE = "\n\x02E+\n", "\n\x02E-\n"
+TOKEN_RE = re.compile("\x01([+-])([a-z]+)(?:\x03([^\x01]*))?\x01")
+STRUCT_RE = re.compile("\x02(?:P|R|Q\\+|Q-|E\\+|E-)")
+
+ROW_SEP = "────────"      # разделитель между строками таблицы
+ROW_MAX_LEN = 300        # строки длиннее считаем вёрсткой, а не таблицей с данными
+INDENT = " "        # отступ для вложенных списков (не съедается Telegram)
+BULLETS = ["•", "◦", "▪"]
+
+SKIP_TAGS = {"script", "style", "head", "title"}
+VOID_TAGS = {"br", "hr", "img", "meta", "link", "input", "wbr", "col", "source", "area", "base"}
+BLOCK_TAGS = {"div", "section", "article", "header", "footer", "center", "main",
+              "nav", "aside", "address", "figure", "figcaption", "dl", "dt", "dd", "form"}
+HEADINGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+TAG_STYLES = {"b": "b", "strong": "b", "th": "b", "i": "i", "em": "i", "cite": "i",
+              "u": "u", "ins": "u", "s": "s", "strike": "s", "del": "s"}
+CELL_TAGS = {"td", "th"}
+TABLE_STOP = {"td", "th", "tr", "table"}
+
+FWD_RE = re.compile(r"forwarded message|begin forwarded|пересылаемое сообщение|"
+                    r"пересланное сообщение|переадресованн|(subject|тема):\s*(fw|fwd|пересл)",
+                    re.I)
+
+
+def open_tok(name, href=None):
+    return f"\x01+{name}\x03{href}\x01" if href is not None else f"\x01+{name}\x01"
+
+
+def close_tok(name):
+    return f"\x01-{name}\x01"
+
+
+def strip_marks(text):
+    """Видимый текст: без служебных меток и HTML-тегов."""
+    text = TOKEN_RE.sub("", STRUCT_RE.sub("", text))
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
+def visible_len(line):
+    """Длина строки так, как её считает Telegram: без тегов и адресов ссылок."""
+    return len(strip_marks(line))
+
+
+def style_tokens(tag, attrs):
+    """Какие начертания включает элемент: по тегу и по inline-стилю."""
+    names = []
+    if tag in TAG_STYLES:
+        names.append(TAG_STYLES[tag])
+    if tag in HEADINGS:
+        names.append("b")
+    style = (attrs.get("style") or "").lower()
+    if style:
+        if re.search(r"font-weight\s*:\s*(bold|bolder|[6-9]00)", style):
+            names.append("b")
+        if re.search(r"font-style\s*:\s*italic", style):
+            names.append("i")
+        if re.search(r"text-decoration[^;]*line-through", style):
+            names.append("s")
+    return list(dict.fromkeys(names))
+
+
+def zero_margin(style, side):
+    """True, если у <p> нулевой внешний отступ сверху/снизу (тогда это не абзац)."""
+    style = (style or "").lower().replace(" ", "")
+    m = re.search(rf"margin-{side}:(-?[\d.]+)", style)
+    if m:
+        return float(m.group(1)) == 0
+    m = re.search(r"margin:([^;]+)", style)
+    if not m:
+        return False
+    values = re.findall(r"-?[\d.]+", m.group(1))
+    if not values:
+        return False
+    if side == "top":
+        value = values[0]
+    else:
+        value = values[2] if len(values) >= 3 else values[0]
+    return float(value) == 0
 
 
 class _HTMLToTelegram(HTMLParser):
-    """Превращает HTML письма в текст для Telegram: строки + ссылки <a>.
-
-    Строка таблицы с данными: каждая ячейка — отдельной строкой,
-    между строками таблицы — разделитель. Большие ячейки (вёрстка письма)
-    выводятся просто друг под другом.
-    """
+    """Разбирает HTML письма в текст со служебными метками (см. выше)."""
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.bufs = [[]]     # стек буферов: основной текст и открытые ячейки
-        self.rows = []       # стек открытых строк: {"cells": [...], "cell": bool}
-        self.tables = []     # для каждой открытой <table> — сколько строк было открыто до неё
+        self.bufs = [[]]       # стек буферов: основной текст и открытые ячейки таблиц
+        self.elems = []        # стек открытых элементов: {"tag", "tokens", "end", ...}
+        self.rows = []         # стек открытых строк таблиц: {"cells": [...], "cell": bool}
+        self.tables = []       # для каждой открытой <table> — сколько строк было открыто до неё
+        self.lists = []        # стек списков: {"ol": bool, "n": номер}
+        self.blocks = []       # стек div/p: был ли в них текст и <br> (для пустых строк)
+        self.links = []        # стек ссылок: (href, буфер, индекс начала)
         self.skip = 0
-        self.links = []      # стек: (href, буфер, индекс начала)
-        self.has_table = False   # нашлась ли в письме таблица с данными
+        self.pre = 0
+        self.prefix = None     # маркер пункта списка, ждущий первого текста
+        self.quote_rest = False
+        self.has_table = False
+        self.hidden = None     # [тег, глубина] — внутри скрытого элемента (display:none)
 
-    # -- буферы и таблицы
     @property
     def buf(self):
         return self.bufs[-1]
 
+    def emit(self, text):
+        self.buf.append(text)
+
+    # -- стек элементов
+    def push(self, tag, tokens=(), end="", **extra):
+        for name in tokens:
+            self.emit(open_tok(name))
+        self.elems.append({"tag": tag, "tokens": list(tokens), "end": end, **extra})
+
+    def pop_entry(self):
+        entry = self.elems.pop()
+        for name in reversed(entry["tokens"]):
+            self.emit(close_tok(name))
+        if entry.get("list"):
+            if self.lists:
+                self.lists.pop()
+        if entry.get("block") and self.blocks:
+            info = self.blocks.pop()
+            if not info["text"] and (info["br"] or info.get("nbsp")):
+                self.emit(PARA)            # <div><br></div>, <p>&nbsp;</p> — пустая строка
+            elif info["text"] and self.blocks:
+                self.blocks[-1]["text"] = True
+        if entry.get("pre"):
+            self.pre = max(0, self.pre - 1)
+        self.emit(entry["end"])
+
+    def pop_to(self, names, stop=TABLE_STOP):
+        """Закрывает элементы до ближайшего с тегом из names (не выходя за stop)."""
+        for i in range(len(self.elems) - 1, -1, -1):
+            tag = self.elems[i]["tag"]
+            if tag in names:
+                while len(self.elems) > i:
+                    self.pop_entry()
+                return True
+            if tag in stop:
+                return False
+        return False
+
+    # -- таблицы
     def row_in_table(self):
         return not self.tables or len(self.rows) > self.tables[-1]
 
@@ -172,6 +300,7 @@ class _HTMLToTelegram(HTMLParser):
         if not self.rows or not self.row_in_table():
             self.rows.append({"cells": [], "cell": False})
         if self.rows[-1]["cell"]:
+            self.pop_to(CELL_TAGS, stop={"tr", "table"})
             self.close_cell()
         self.bufs.append([])
         self.rows[-1]["cell"] = True
@@ -180,14 +309,15 @@ class _HTMLToTelegram(HTMLParser):
         row = self.rows[-1]
         if not row["cell"]:
             return
-        lines = tidy_lines("".join(self.bufs.pop()))
+        raw = "".join(self.bufs.pop())
         row["cell"] = False
-        if lines:
-            row["cells"].append(lines)
+        if strip_marks(raw).strip():
+            row["cells"].append(raw)
 
     def open_row(self):
-        if self.rows and not self.rows[-1]["cell"] and self.row_in_table():
-            self.close_row()          # предыдущая строка не была закрыта
+        if self.rows and self.row_in_table():
+            self.pop_to({"tr"}, stop={"table"})
+            self.close_row()
         self.rows.append({"cells": [], "cell": False})
 
     def close_row(self):
@@ -198,123 +328,378 @@ class _HTMLToTelegram(HTMLParser):
         cells = self.rows.pop()["cells"]
         if not cells:
             return
-        flat = [" ".join(lines) for lines in cells]
+        visible = [[l for l in (strip_marks(x).strip() for x in c.split("\n")) if l] for c in cells]
         is_data_row = (
             len(cells) > 1
-            and all(len(lines) <= 3 for lines in cells)
-            and sum(visible_len(c) for c in flat) <= ROW_MAX_LEN
+            and all(len(v) <= 3 for v in visible)
+            and sum(len(" ".join(v)) for v in visible) <= ROW_MAX_LEN
         )
         if is_data_row:
             self.has_table = True
-            text = "\n".join([ROW_SEP] + flat + [ROW_SEP])
+            flat = [re.sub(r"\s+", " ", STRUCT_RE.sub(" ", c.replace("\n", " "))) for c in cells]
+            self.emit(ROWSEP + "\n".join(flat) + ROWSEP)
         else:
-            text = "\n".join(line for lines in cells for line in lines)
-        self.buf.append("\n" + text + "\n")
-
-    def close_rows_to(self, depth):
-        while len(self.rows) > depth:
-            self.close_row()
+            self.emit("\n" + "\n".join(cells) + "\n")
 
     # -- разбор
-    def handle_starttag(self, tag, attrs):
+    def handle_starttag(self, tag, attrs_list):
+        attrs = {k: (v or "") for k, v in attrs_list}
         if tag in SKIP_TAGS:
             self.skip += 1
-        elif tag == "table":
-            self.buf.append("\n")
+            return
+        if self.skip:
+            return
+        if self.hidden:
+            if tag == self.hidden[0] and tag not in VOID_TAGS:
+                self.hidden[1] += 1
+            return
+        style = (attrs.get("style") or "").lower().replace(" ", "")
+        if tag not in VOID_TAGS and ("display:none" in style or "mso-hide:all" in style
+                                     or "visibility:hidden" in style or "hidden" in attrs):
+            self.hidden = [tag, 1]         # скрытый текст рассылок — пропускаем
+            return
+
+        if tag == "br":
+            self.emit("\n")
+            if self.blocks:
+                self.blocks[-1]["br"] = True
+            return
+        if tag == "hr":
+            self.emit(PARA)
+            return
+        if tag in VOID_TAGS:
+            return
+
+        # Outlook: всё после этой метки — история переписки
+        ident = (attrs.get("id") or "").lower()
+        if not self.quote_rest and ident in ("divrplyfwdmsg", "appendonsend"):
+            self.quote_rest = True
+            self.emit(Q_OPEN)
+
+        styles = style_tokens(tag, attrs)
+        cls = (attrs.get("class") or "").lower()
+
+        if tag == "table":
+            self.emit("\n")
             self.tables.append(len(self.rows))
+            self.push(tag, styles, "\n")
         elif tag == "tr":
             self.open_row()
-        elif tag in ("td", "th"):
+            self.push(tag, styles)
+        elif tag in CELL_TAGS:
             self.open_cell()
-        elif tag in BLOCK_TAGS:
-            self.buf.append("\n")
+            self.push(tag, styles)
+        elif tag in ("ul", "ol"):
+            top = not self.lists
+            start = attrs.get("start") or "1"
+            self.lists.append({"ol": tag == "ol", "n": int(start) - 1 if start.isdigit() else 0})
+            self.emit(PARA if top else "\n")
+            self.push(tag, styles, PARA if top else "\n", list=True)
         elif tag == "li":
-            self.buf.append("\n• ")
+            self.pop_to({"li"}, stop={"ul", "ol"} | TABLE_STOP)
+            depth = max(len(self.lists), 1)
+            if self.lists and self.lists[-1]["ol"]:
+                self.lists[-1]["n"] += 1
+                marker = f"{self.lists[-1]['n']}."
+            else:
+                marker = BULLETS[min(depth, len(BULLETS)) - 1]
+            self.emit("\n")
+            self.prefix = INDENT * (depth - 1) + marker + " "
+            self.push(tag, styles, "\n")
+        elif tag == "blockquote":
+            self.emit(Q_OPEN)
+            self.push(tag, styles, Q_CLOSE)
+        elif tag == "pre":
+            self.emit(PRE_OPEN)
+            self.pre += 1
+            self.push(tag, (), PRE_CLOSE, pre=True)
+        elif tag == "p" or tag in HEADINGS:
+            style = attrs.get("style")
+            in_li = any(e["tag"] == "li" for e in self.elems)
+            if in_li:
+                style = "margin:0"          # абзац внутри пункта списка — без пустых строк
+            is_para = tag in HEADINGS or not zero_margin(style, "top")
+            self.emit(PARA if is_para else "\n")
+            self.blocks.append({"text": False, "br": False})
+            end = PARA if ((tag in HEADINGS and not in_li) or not zero_margin(style, "bottom")) else "\n"
+            self.push(tag, styles, end, block=True)
+        elif tag in BLOCK_TAGS:
+            if "gmail_quote" in cls and "gmail_quote_container" not in cls:
+                self.emit(Q_OPEN)
+                self.blocks.append({"text": False, "br": False})
+                self.push(tag, styles, Q_CLOSE, block=True)
+            else:
+                self.emit("\n")
+                self.blocks.append({"text": False, "br": False})
+                self.push(tag, styles, "\n", block=True)
         elif tag == "a":
-            href = (dict(attrs).get("href") or "").strip()
-            if not re.match(r"(https?://|mailto:)", href, re.I):
+            if self.prefix:
+                self.emit(self.prefix)
+                self.prefix = None
+            href = attrs.get("href", "").strip()
+            if not re.match(r"(https?://|mailto:|tel:)", href, re.I):
                 href = ""
             self.links.append((href, self.buf, len(self.buf)))
+            self.push(tag, styles)
+        else:
+            self.push(tag, styles)
 
     def handle_endtag(self, tag):
         if tag in SKIP_TAGS:
             self.skip = max(0, self.skip - 1)
-        elif tag == "table":
-            if self.tables:
-                self.close_rows_to(self.tables.pop())
-            self.buf.append("\n")
+            return
+        if self.skip or tag in VOID_TAGS:
+            return
+        if self.hidden:
+            if tag == self.hidden[0]:
+                self.hidden[1] -= 1
+                if self.hidden[1] == 0:
+                    self.hidden = None
+            return
+        if tag == "table":
+            if self.pop_to({"table"}, stop=set()) and self.tables:
+                depth = self.tables.pop()
+                while len(self.rows) > depth:
+                    self.close_row()
         elif tag == "tr":
-            if self.rows and self.row_in_table():
+            if self.pop_to({"tr"}, stop={"table"}) and self.rows and self.row_in_table():
                 self.close_row()
-        elif tag in ("td", "th"):
-            if self.rows:
+        elif tag in CELL_TAGS:
+            if self.pop_to(CELL_TAGS, stop={"tr", "table"}) and self.rows:
                 self.close_cell()
-        elif tag in BLOCK_TAGS or tag == "li":
-            self.buf.append("\n")
-        elif tag == "a" and self.links:
+        elif tag == "a":
+            if not self.pop_to({"a"}):
+                return
+            if not self.links:
+                return
             href, buf, start = self.links.pop()
             if buf is not self.buf:
-                return                # ссылка «перешагнула» ячейку — оставляем как есть
-            inner = re.sub(r"\s+", " ", "".join(buf[start:])).strip()
+                return                     # ссылка «перешагнула» ячейку — оставляем текст
+            inner = "".join(buf[start:])
+            inner = re.sub(r"\s+", " ", STRUCT_RE.sub(" ", inner.replace("\n", " "))).strip()
             del buf[start:]
-            if href and inner and "<a " not in inner:
-                buf.append(f' <a href="{html.escape(href, quote=True)}">{inner}</a> ')
+            if href and strip_marks(inner).strip() and "\x01+a" not in inner:
+                buf.append(" " + open_tok("a", html.escape(href, quote=True)) + inner + close_tok("a") + " ")
             elif inner:
-                buf.append(f" {inner} ")
+                buf.append(" " + inner + " ")
+        else:
+            self.pop_to({tag})
 
     def handle_data(self, data):
-        if self.skip:
+        if self.skip or self.hidden:
             return
+        if self.pre:
+            text = strip_invisible(data).replace("\r", "").replace("\t", "    ")
+            self.emit(html.escape(text, quote=False))
+            return
+        if self.blocks and "\xa0" in data and not strip_invisible(data).strip():
+            self.blocks[-1]["nbsp"] = True
         text = re.sub(r"\s+", " ", strip_invisible(data))
-        if text:
-            self.buf.append(html.escape(text, quote=False))
+        if not text:
+            return
+        if text.strip():
+            if self.prefix:
+                self.emit(self.prefix)
+                self.prefix = None
+            if self.blocks:
+                self.blocks[-1]["text"] = True
+        self.emit(html.escape(text, quote=False))
 
     def result(self):
-        self.close_rows_to(0)
-        while len(self.bufs) > 1:     # незакрытые ячейки без строк
+        while self.elems:
+            self.pop_entry()
+        while self.rows:
+            self.close_row()
+        while len(self.bufs) > 1:
             inner = self.bufs.pop()
             self.buf.extend(inner)
+        if self.quote_rest:
+            self.emit(Q_CLOSE)
         return "".join(self.bufs[0])
 
 
-def tidy_lines(text):
-    """Убирает пустые строки и лишние разделители, приклеивает огрызки вроде «₽»."""
-    lines = []
-    for line in text.split("\n"):
-        line = re.sub(r"[ \t]+", " ", line).strip()
-        visible = re.sub(r"<[^>]+>", "", line).strip()
-        if not visible or visible == "•":
-            continue
-        if line == ROW_SEP:
-            if lines and lines[-1] == ROW_SEP:
-                continue              # два разделителя подряд — оставляем один
-            lines.append(line)
-        elif lines and lines[-1] != ROW_SEP and len(visible) <= 2 and "<a " not in line:
-            lines[-1] += " " + line
+# ---------------------------------------------------------------- записи текста
+#
+# Текст письма — список записей (text, kind, quote):
+#   kind:  "text" — строка, "para" — пустая строка, "sep" — разделитель таблицы,
+#          "pre" — строка моноширинного блока
+#   quote: False, "quote" (сворачиваемая цитата) или "fwd" (пересланное письмо)
+
+def balance_line(line, active):
+    """Делает из строки с метками корректный HTML: открывает начертания,
+    действующие с прошлых строк, и закрывает всё в конце строки."""
+    def open_html(name, href):
+        return f'<a href="{href}">' if name == "a" else f"<{name}>"
+
+    out = [open_html(n, h) for n, h in active]
+    pos = 0
+    for m in TOKEN_RE.finditer(line):
+        out.append(line[pos:m.start()])
+        pos = m.end()
+        sign, name, href = m.group(1), m.group(2), m.group(3)
+        if sign == "+":
+            if name != "a" and any(n == name for n, _ in active):
+                continue                    # уже действует — второй раз не открываем
+            active.append((name, href))
+            out.append(open_html(name, href))
         else:
-            lines.append(line)
-    return lines
+            idx = next((i for i in range(len(active) - 1, -1, -1) if active[i][0] == name), None)
+            if idx is None:
+                continue
+            above = active[idx + 1:]
+            for n, _ in reversed(above):
+                out.append(f"</{n}>")
+            out.append(f"</{name}>")
+            del active[idx:]
+            for n, h in above:
+                active.append((n, h))
+                out.append(open_html(n, h))
+    out.append(line[pos:])
+    for n, _ in reversed(active):
+        out.append(f"</{n}>")
+    text = "".join(out)
+    # пустые пары тегов и пробелы внутри краёв
+    for _ in range(3):
+        text = re.sub(r"<(b|i|u|s)>(\s*)</\1>", r"\2", text)
+        text = re.sub(r'<a href="[^"]*">(\s*)</a>', r"\1", text)
+    return text
+
+
+def render_marked(marked):
+    """Текст со служебными метками → список записей."""
+    entries, active = [], []
+    quote, pre = 0, 0
+    for raw in marked.split("\n"):
+        mark = raw.strip()
+        if mark == "\x02P":
+            entries.append(("", "para", bool(quote)))
+            continue
+        if mark == "\x02R":
+            entries.append((ROW_SEP, "sep", bool(quote)))
+            continue
+        if mark in ("\x02Q+", "\x02Q-"):
+            quote = quote + 1 if mark == "\x02Q+" else max(0, quote - 1)
+            entries.append(("", "para", bool(quote)))
+            continue
+        if mark in ("\x02E+", "\x02E-"):
+            pre = pre + 1 if mark == "\x02E+" else max(0, pre - 1)
+            continue
+        if pre:
+            line = TOKEN_RE.sub("", raw).rstrip()
+            entries.append((line, "pre", bool(quote)))
+            continue
+        line = re.sub(r"[ \t]+", " ", raw).strip(" \t")
+        line = balance_line(line, active)
+        line = re.sub(r"^((?:[ \t]*<[^>]+>)*)[ \t]+", r"\1", line)    # пробелы в начале
+        line = re.sub(r"[ \t]+((?:</[^>]+>[ \t]*)*)$", r"\1", line)    # и в конце
+        if not strip_marks(line).strip():
+            continue
+        entries.append((line, "text", bool(quote)))
+    return entries
+
+
+def normalize(entries):
+    """Наводит порядок: схлопывает пустые строки, приклеивает огрызки вроде «₽»,
+    помечает пересланные письма."""
+    out = []
+    for text, kind, quote in entries:
+        if kind == "para":
+            if out and out[-1][1] not in ("para", "sep") and not (out[-1][1] == "pre" and False):
+                out.append(("", "para", quote))
+            continue
+        if kind == "sep":
+            while out and out[-1][1] == "para":
+                out.pop()
+            if out and out[-1][1] == "sep":
+                continue
+            out.append((text, kind, quote))
+            continue
+        if kind == "text" and out and out[-1][1] == "text" and out[-1][2] == quote:
+            vis = strip_marks(text).strip()
+            prev_vis = strip_marks(out[-1][0]).strip()
+            if (len(vis) <= 2 and "<a " not in text and not re.match(r"^[•◦▪\d]", vis)
+                    and not re.match(r"^( )*([•◦▪]|\d+\.)$", prev_vis)):
+                out[-1] = (out[-1][0] + " " + text, "text", quote)
+                continue
+        if out and out[-1][1] == "para" and out[-1][2] != quote:
+            out[-1] = ("", "para", False)
+        out.append((text, kind, quote))
+
+    # убрать пустые строки и разделители по краям
+    while out and out[0][1] in ("para", "sep"):
+        out.pop(0)
+    while out and out[-1][1] in ("para", "sep"):
+        out.pop()
+    # пустая строка прямо перед/после разделителя таблицы не нужна
+    out = [e for i, e in enumerate(out)
+           if not (e[1] == "para" and ((i + 1 < len(out) and out[i + 1][1] == "sep")
+                                        or (i > 0 and out[i - 1][1] == "sep")))]
+
+    # разделитель таблицы на границе с цитатой — лишний
+    def neighbour(idx, step):
+        idx += step
+        while 0 <= idx < len(out) and out[idx][1] == "para":
+            idx += step
+        return out[idx] if 0 <= idx < len(out) else None
+    out = [e for i, e in enumerate(out)
+           if not (e[1] == "sep" and any(n is None or n[2] != e[2]
+                                          for n in (neighbour(i, -1), neighbour(i, 1))))]
+
+    # цитата, которая начинается как пересланное письмо, — не сворачиваем
+    result, i = [], 0
+    while i < len(out):
+        if not out[i][2]:
+            result.append((out[i][0], out[i][1], False))
+            i += 1
+            continue
+        j = i
+        while j < len(out) and out[j][2]:
+            j += 1
+        run = out[i:j]
+        head = " ".join(strip_marks(t) for t, k, _ in run[:8] if k == "text")
+        mode = "fwd" if FWD_RE.search(head) else "quote"
+        # пустые строки по краям цитаты выносим наружу
+        while run and run[0][1] == "para":
+            run.pop(0)
+        while run and run[-1][1] == "para":
+            run.pop()
+        result.extend((t, k, mode) for t, k, _ in run)
+        i = j
+    return result
 
 
 def parse_html(raw):
-    """Возвращает (строки текста, есть ли в письме таблица с данными)."""
+    """Возвращает (записи текста, есть ли в письме таблица с данными)."""
     parser = _HTMLToTelegram()
     parser.feed(raw)
     parser.close()
-    lines = tidy_lines(parser.result())
-    while lines and lines[0] == ROW_SEP:
-        lines.pop(0)
-    while lines and lines[-1] == ROW_SEP:
-        lines.pop()
-    return lines, parser.has_table
+    return normalize(render_marked(parser.result())), parser.has_table
 
 
-def plain_body_lines(raw):
+ATTRIBUTION_RE = re.compile(r"(wrote|писал|написал|пишет)[^:]*:\s*$|^\s*\d.*<[^>]+@[^>]+>.*:\s*$", re.I)
+
+
+def plain_entries(raw):
+    """Текст письма без HTML: абзацы по пустым строкам, «>» — цитата."""
     text = strip_invisible(raw.replace("\r", ""))
-    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
-    lines = [html.escape(re.sub(r"[ \t]+", " ", l).rstrip(), quote=False)
-             for l in text.strip().split("\n")]
-    return lines
+    entries = []
+    for line in text.split("\n"):
+        quote = False
+        m = re.match(r"^\s*((?:>\s?)+)(.*)$", line)
+        if m:
+            quote, line = True, m.group(2)
+        line = line.rstrip()
+        if not line.strip():
+            entries.append(("", "para", quote))
+        else:
+            entries.append((html.escape(line, quote=False), "text", quote))
+    # строка «… писал(а):» перед цитатой — тоже часть цитаты
+    for i, (t, k, q) in enumerate(entries):
+        if k == "text" and not q and ATTRIBUTION_RE.search(html.unescape(t)):
+            nxt = next((e for e in entries[i + 1:] if e[1] != "para"), None)
+            if nxt and nxt[2]:
+                entries[i] = (t, k, True)
+    return normalize(entries)
 
 
 def part_text(part):
@@ -328,58 +713,94 @@ def part_text(part):
 def get_body(msg):
     """Текст письма для Telegram.
 
-    Возвращает (строки в формате Telegram HTML, исходный HTML или None,
-    есть ли в письме таблица с данными).
+    Возвращает (записи текста, исходный HTML или None, есть ли таблица с данными).
     """
     html_part = msg.get_body(preferencelist=("html",))
     if html_part is not None:
         raw_html = part_text(html_part)
-        lines, has_table = parse_html(raw_html)
-        if lines:
-            return lines, raw_html, has_table
+        entries, has_table = parse_html(raw_html)
+        if entries:
+            return entries, raw_html, has_table
     plain_part = msg.get_body(preferencelist=("plain",))
     if plain_part is not None:
-        return plain_body_lines(part_text(plain_part)), None, False
+        return plain_entries(part_text(plain_part)), None, False
     return [], None, False
 
 
-def visible_len(line):
-    """Длина строки так, как её считает Telegram: без тегов и адресов ссылок."""
-    return len(html.unescape(re.sub(r"<[^>]+>", "", line)))
-
+# ---------------------------------------------------------------- деление на сообщения
 
 def split_long_line(line, limit):
-    """Очень длинную строку без разметки режет на куски."""
+    """Очень длинную строку режет на куски (разметка в этом случае теряется)."""
     if visible_len(line) <= limit:
         return [line]
-    plain = html.unescape(re.sub(r"<[^>]+>", "", line))
+    plain = strip_marks(line)
     return [html.escape(plain[i:i + limit], quote=False) for i in range(0, len(plain), limit)]
 
 
-def split_parts(header, lines):
+def render_entries(entries):
+    """Записи одной части → HTML для Telegram (цитаты и <pre> оборачиваются)."""
+    blocks, i = [], 0
+    while i < len(entries):
+        quote = entries[i][2]
+        j = i
+        while j < len(entries) and entries[j][2] == quote:
+            j += 1
+        group = entries[i:j]
+        i = j
+
+        lines, k = [], 0
+        while k < len(group):
+            text, kind, _ = group[k]
+            if kind == "pre" and not quote:
+                run = []
+                while k < len(group) and group[k][1] == "pre":
+                    run.append(group[k][0])
+                    k += 1
+                lines.append("<pre>" + "\n".join(run).strip("\n") + "</pre>")
+                continue
+            lines.append("" if kind == "para" else text)
+            k += 1
+        body = "\n".join(lines).strip("\n")
+        if not body:
+            continue
+        if quote == "quote":
+            body = f"<blockquote expandable>{body}</blockquote>"
+        elif quote == "fwd":
+            body = f"<blockquote>{body}</blockquote>"
+        blocks.append(body)
+    text = "\n".join(blocks)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def split_parts(header, entries):
     """Делит письмо на части, каждая влезает в одно сообщение Telegram."""
-    parts, current = [], [header, ""]
-    size, raw = visible_len(header) + 1, len(header) + 1
-    for line in lines:
-        for piece in split_long_line(line, PART_LIMIT - 100):
+    parts, current = [], [(header, "text", False), ("", "para", False)]
+    size, raw = visible_len(header) + 2, len(header) + 2
+    for text, kind, quote in entries:
+        pieces = split_long_line(text, PART_LIMIT - 200) if kind == "text" else [text]
+        for piece in pieces:
             length = visible_len(piece) + 1
             # второе условие — подстраховка от огромных адресов ссылок
-            if size + length > PART_LIMIT or raw + len(piece) > RAW_LIMIT:
-                parts.append("\n".join(current).strip())
+            if size + length > PART_LIMIT or raw + len(piece) + 40 > RAW_LIMIT:
+                parts.append(current)
                 current, size, raw = [], 0, 0
-            current.append(piece)
+                if kind == "para":
+                    continue
+            current.append((piece, kind, quote))
             size += length
-            raw += len(piece) + 1
+            raw += len(piece) + 40          # 40 — запас на теги цитат
     if current:
-        parts.append("\n".join(current).strip())
-    parts = [p for p in parts if p]
+        parts.append(current)
 
-    if len(parts) > MAX_PARTS:
-        parts = parts[:MAX_PARTS]
-        parts[-1] += "\n…\n<i>[письмо очень длинное, продолжение — в почте]</i>"
-    if len(parts) > 1:
-        parts = [f"{p}\n\n<i>(часть {i} из {len(parts)})</i>" for i, p in enumerate(parts, 1)]
-    return parts
+    rendered = [render_entries(p) for p in parts]
+    rendered = [p for p in rendered if p]
+    if len(rendered) > MAX_PARTS:
+        rendered = rendered[:MAX_PARTS]
+        rendered[-1] += "\n…\n<i>[письмо очень длинное, продолжение — в почте]</i>"
+    if len(rendered) > 1:
+        rendered = [f"{p}\n\n<i>(часть {i} из {len(rendered)})</i>"
+                    for i, p in enumerate(rendered, 1)]
+    return rendered
 
 
 def get_attachments(msg):
@@ -443,8 +864,8 @@ def build_header(msg, raw_msg):
     return "\n".join(lines)
 
 
-def build_messages(msg, raw_msg, lines):
-    return split_parts(build_header(msg, raw_msg), lines)
+def build_messages(msg, raw_msg, entries):
+    return split_parts(build_header(msg, raw_msg), entries)
 
 
 def to_plain(text):
@@ -456,9 +877,9 @@ def to_plain(text):
 def forward(raw_bytes):
     msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
     raw_msg = email.message_from_bytes(raw_bytes, policy=email.policy.compat32)
-    lines, raw_html, has_table = get_body(msg)
+    entries, raw_html, has_table = get_body(msg)
     reply_to = None
-    for text in build_messages(msg, raw_msg, lines):
+    for text in build_messages(msg, raw_msg, entries):
         try:
             sent = send_text(text, reply_to=reply_to)
         except RuntimeError as err:
@@ -490,6 +911,7 @@ def forward(raw_bytes):
 # ---------------------------------------------------------------- скриншот письма
 
 SHOT_WIDTH = 680            # ширина «окна», px (письма обычно свёрстаны под 600 px)
+SHOT_MAX_WIDTH = 1200       # шире не делаем, иначе на телефоне будет мелко
 SHOT_SCALE = 2              # чёткость картинки
 SHOT_CHUNK = 1800           # высота одного кадра, px (длинное письмо режется на кадры)
 SHOT_MAX = 10               # не больше 10 картинок (лимит альбома Telegram)
@@ -524,7 +946,7 @@ def render_screenshots(page_html):
             browser = p.chromium.launch()                   # Chromium от Playwright, если есть
         try:
             context = browser.new_context(
-                viewport={"width": SHOT_WIDTH, "height": 800},
+                viewport={"width": SHOT_WIDTH, "height": 100},   # высота подстроится под письмо
                 device_scale_factor=SHOT_SCALE,
                 java_script_enabled=False,                    # скрипты из писем не выполняем
             )
@@ -533,8 +955,23 @@ def render_screenshots(page_html):
                 page.set_content(page_html, wait_until="load", timeout=20000)
             except Exception:
                 pass                                          # часть картинок не успела — не страшно
+
+            # Письмо шире окна (например, iCloud) — расширяем окно под письмо,
+            # иначе правая часть обрезается.
+            try:
+                content_width = page.evaluate(
+                    "Math.max(document.documentElement.scrollWidth,"
+                    " document.body ? document.body.scrollWidth : 0)")
+            except Exception:
+                content_width = SHOT_WIDTH
+            width = min(max(int(content_width or 0), SHOT_WIDTH), SHOT_MAX_WIDTH)
+            if width != SHOT_WIDTH:
+                page.set_viewport_size({"width": width, "height": 100})
+                page.wait_for_timeout(300)
+
             full = page.screenshot(full_page=True)
-            _, height_px = png_size(full)
+            width_px, height_px = png_size(full)
+            width = width_px // SHOT_SCALE
             height = height_px // SHOT_SCALE
             if height <= SHOT_CHUNK * 1.3:
                 return [full]
@@ -542,7 +979,7 @@ def render_screenshots(page_html):
             for top in range(0, height, SHOT_CHUNK):
                 if len(shots) >= SHOT_MAX:
                     break
-                clip = {"x": 0, "y": top, "width": SHOT_WIDTH,
+                clip = {"x": 0, "y": top, "width": width,
                         "height": min(SHOT_CHUNK, height - top)}
                 shots.append(page.screenshot(full_page=True, clip=clip))
             return shots

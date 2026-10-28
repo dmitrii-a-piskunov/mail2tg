@@ -45,8 +45,8 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           BACKFILL_SINCE: ${{ inputs.since }}
           MAX_PER_RUN: ${{ inputs.max_per_run }}
-          # картинка письма: auto — только письма с таблицами, always — всегда, off — выключить
-          SCREENSHOTS: auto
+          # картинка письма: always — для всех писем, auto — только с таблицами, off — выключить
+          SCREENSHOTS: always
 
       - name: Сохранить состояние
         if: always()
