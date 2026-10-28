@@ -968,18 +968,43 @@ def forward(raw_bytes):
             reply_to = sent["message_id"]   # продолжение и файлы — ответом на первую часть
         time.sleep(1)
 
+    # порядок: письмо → вложения → скриншот
+    send_attachments(get_attachments(msg), reply_to)
+
     if raw_html and (SCREENSHOTS == "always" or (SCREENSHOTS == "auto" and has_table)):
         send_screenshot(msg, raw_html, reply_to)
 
-    for filename, content in get_attachments(msg):
-        if len(content) > TG_FILE_LIMIT:
-            send_text(
-                f"📎 Файл «{html.escape(filename)}» больше 50 МБ — откройте его в почте.",
-                reply_to=reply_to,
-            )
+
+ALBUM_MAX = 10              # больше файлов в одном альбоме Telegram не разрешает
+
+
+def send_attachments(attachments, reply_to):
+    """Вложения ответом на пост: альбомами по 10 файлов."""
+    too_big = [name for name, content in attachments if len(content) > TG_FILE_LIMIT]
+    files = [(name, content) for name, content in attachments if len(content) <= TG_FILE_LIMIT]
+
+    for start in range(0, len(files), ALBUM_MAX):
+        chunk = files[start:start + ALBUM_MAX]
+        if len(chunk) == 1:
+            send_file(chunk[0][0], chunk[0][1], reply_to=reply_to)
         else:
-            send_file(filename, content, reply_to=reply_to)
+            media = [{"type": "document", "media": f"attach://file{i}"} for i in range(len(chunk))]
+            data = {"chat_id": TG_CHAT_ID, "media": json.dumps(media)}
+            if reply_to:
+                data["reply_to_message_id"] = reply_to
+            upload = {f"file{i}": (name, content) for i, (name, content) in enumerate(chunk)}
+            try:
+                tg_call("sendMediaGroup", data, files=upload)
+            except RuntimeError:
+                # альбом не принят (например, необычный файл) — отправляем по одному
+                for name, content in chunk:
+                    send_file(name, content, reply_to=reply_to)
+                    time.sleep(1)
         time.sleep(1)
+
+    if too_big:
+        names = ", ".join(f"«{html.escape(n)}»" for n in too_big)
+        send_text(f"📎 Больше 50 МБ, откройте в почте: {names}", reply_to=reply_to)
 
 
 # ---------------------------------------------------------------- скриншот письма
