@@ -92,10 +92,17 @@ def save_state(state):
 # ---------------------------------------------------------------- Telegram
 
 def tg_call(method, data=None, files=None):
-    """Вызов Bot API с повтором при ограничении частоты (429)."""
+    """Вызов Bot API с повторами: при обрыве связи и при ограничении частоты (429)."""
     for attempt in range(5):
-        resp = requests.post(f"{TG_API}/{method}", data=data, files=files, timeout=60)
-        payload = resp.json()
+        try:
+            resp = requests.post(f"{TG_API}/{method}", data=data, files=files, timeout=60)
+            payload = resp.json()
+        except (requests.ConnectionError, requests.Timeout, ValueError):
+            # обрыв соединения или пустой ответ — ждём и пробуем ещё раз
+            if attempt == 4:
+                raise
+            time.sleep(3 * (attempt + 1))
+            continue
         if payload.get("ok"):
             return payload["result"]
         if resp.status_code == 429:
