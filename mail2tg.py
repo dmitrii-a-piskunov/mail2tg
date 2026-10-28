@@ -160,10 +160,13 @@ PARA, ROWSEP = "\n\x02P\n", "\n\x02R\n"
 Q_OPEN, Q_CLOSE = "\n\x02Q+\n", "\n\x02Q-\n"
 PRE_OPEN, PRE_CLOSE = "\n\x02E+\n", "\n\x02E-\n"
 TOKEN_RE = re.compile("\x01([+-])([a-z]+)(?:\x03([^\x01]*))?\x01")
-STRUCT_RE = re.compile("\x02(?:P|R|Q\\+|Q-|E\\+|E-)")
+STRUCT_RE = re.compile("\x02(?:P|R|Q\\+|Q-|E\\+|E-|T|C)")
 
 ROW_SEP = "────────"      # разделитель между строками таблицы
 ROW_MAX_LEN = 300        # строки длиннее считаем вёрсткой, а не таблицей с данными
+COMPACT_LEN = 90         # строка таблицы не длиннее — выводится одной строкой
+TABLE_COLLAPSE = 8       # таблица больше стольких строк сворачивается в цитату
+ROW_MARK, CELL_MARK = "\x02T", "\x02C"   # метки строк таблицы (см. render_marked)
 INDENT = " "        # отступ для вложенных списков (не съедается Telegram)
 BULLETS = ["•", "◦", "▪"]
 
@@ -343,8 +346,23 @@ class _HTMLToTelegram(HTMLParser):
         )
         if is_data_row:
             self.has_table = True
-            flat = [re.sub(r"\s+", " ", STRUCT_RE.sub(" ", c.replace("\n", " "))) for c in cells]
-            self.emit(ROWSEP + "\n".join(flat) + ROWSEP)
+            flat = [re.sub(r"\s+", " ", STRUCT_RE.sub(" ", c.replace("\n", " "))).strip()
+                    for c in cells]
+            vis = [strip_marks(c).strip() for c in flat]
+            if len(flat) == 2 and len(vis[0]) + len(vis[1]) + 2 <= COMPACT_LEN:
+                # пара «название — значение»: «Смена: 15»
+                if vis[0].endswith(":") or vis[1].startswith(("=", ":")):
+                    glue = " "
+                elif ":" in vis[0]:
+                    glue = " · "             # в названии уже есть двоеточие («1: Майонез»)
+                else:
+                    glue = ": "
+                self.emit("\n" + ROW_MARK + flat[0] + glue + flat[1] + "\n")
+            elif len(" · ".join(vis)) <= COMPACT_LEN:
+                self.emit("\n" + ROW_MARK + " · ".join(flat) + "\n")
+            else:
+                # длинная строка — каждая ячейка отдельно, между строками черта
+                self.emit(ROWSEP + "\n".join(CELL_MARK + c for c in flat) + ROWSEP)
         else:
             self.emit("\n" + "\n".join(cells) + "\n")
 
@@ -595,13 +613,19 @@ def render_marked(marked):
             line = TOKEN_RE.sub("", raw).rstrip()
             entries.append((line, "pre", bool(quote)))
             continue
+        kind = "text"
+        stripped = raw.lstrip(" \t")
+        if stripped.startswith(ROW_MARK):
+            kind, raw = "trow", stripped[len(ROW_MARK):]
+        elif stripped.startswith(CELL_MARK):
+            kind, raw = "tcell", stripped[len(CELL_MARK):]
         line = re.sub(r"[ \t]+", " ", raw).strip(" \t")
         line = balance_line(line, active)
         line = re.sub(r"^((?:[ \t]*<[^>]+>)*)[ \t]+", r"\1", line)    # пробелы в начале
         line = re.sub(r"[ \t]+((?:</[^>]+>[ \t]*)*)$", r"\1", line)    # и в конце
         if not strip_marks(line).strip():
             continue
-        entries.append((line, "text", bool(quote)))
+        entries.append((line, kind, bool(quote)))
     return entries
 
 
@@ -652,6 +676,27 @@ def normalize(entries):
            if not (e[1] == "sep" and any(n is None or n[2] != e[2]
                                           for n in (neighbour(i, -1), neighbour(i, 1))))]
 
+    # большие таблицы (не внутри цитаты) сворачиваем в цитату-«спойлер»
+    table_kinds = ("trow", "tcell", "sep")
+    i = 0
+    while i < len(out):
+        if out[i][1] not in table_kinds or out[i][2]:
+            i += 1
+            continue
+        j = i
+        while j < len(out) and out[j][1] in table_kinds and not out[j][2]:
+            j += 1
+        run = out[i:j]
+        rows = sum(1 for e in run if e[1] == "trow") + max(0, sum(1 for e in run if e[1] == "sep") - 1)
+        if rows > TABLE_COLLAPSE:
+            while run and run[0][1] == "sep":
+                run.pop(0)
+            while run and run[-1][1] == "sep":
+                run.pop()
+            out[i:j] = [(t, k, "table") for t, k, _ in run]
+            j = i + len(run)
+        i = j
+
     # цитата, которая начинается как пересланное письмо, — не сворачиваем
     result, i = [], 0
     while i < len(out):
@@ -659,8 +704,12 @@ def normalize(entries):
             result.append((out[i][0], out[i][1], False))
             i += 1
             continue
+        if out[i][2] == "table":
+            result.append(out[i])
+            i += 1
+            continue
         j = i
-        while j < len(out) and out[j][2]:
+        while j < len(out) and out[j][2] and out[j][2] != "table":
             j += 1
         run = out[i:j]
         head = " ".join(strip_marks(t) for t, k, _ in run[:8] if k == "text")
@@ -770,7 +819,7 @@ def render_entries(entries):
         body = "\n".join(lines).strip("\n")
         if not body:
             continue
-        if quote == "quote":
+        if quote in ("quote", "table"):
             body = f"<blockquote expandable>{body}</blockquote>"
         elif quote == "fwd":
             body = f"<blockquote>{body}</blockquote>"
