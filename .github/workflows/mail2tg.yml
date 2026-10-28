@@ -1,0 +1,61 @@
+name: Почта → Telegram
+
+on:
+  schedule:
+    # каждые 5 минут — чаще GitHub не позволяет
+    - cron: "*/5 * * * *"
+    # раз в месяц — служебный коммит, чтобы GitHub не отключил расписание
+    # (оно выключается после 60 дней без активности в репозитории)
+    - cron: "17 3 1 * *"
+  workflow_dispatch:      # кнопка ручного запуска во вкладке Actions
+    inputs:
+      since:
+        description: "Переслать старые письма начиная с даты (2026-09-01 или 01.09.2026). Пусто — только новые"
+        required: false
+        default: ""
+      max_per_run:
+        description: "Сколько писем отправить за этот запуск"
+        required: false
+        default: "20"
+
+permissions:
+  contents: write         # нужно, чтобы сохранять state.json
+
+concurrency:
+  group: mail2tg
+  cancel-in-progress: false
+
+jobs:
+  forward:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установить зависимости
+        run: pip install --quiet requests
+
+      - name: Переслать новые письма
+        run: python3 mail2tg.py
+        env:
+          IMAP_USER: ${{ secrets.IMAP_USER }}
+          IMAP_PASSWORD: ${{ secrets.IMAP_PASSWORD }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          BACKFILL_SINCE: ${{ inputs.since }}
+          MAX_PER_RUN: ${{ inputs.max_per_run }}
+
+      - name: Сохранить состояние
+        if: always()
+        run: |
+          git config user.name "mail2tg-bot"
+          git config user.email "mail2tg-bot@users.noreply.github.com"
+          if [ "${{ github.event.schedule }}" = "17 3 1 * *" ]; then
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > keepalive.txt
+            git add keepalive.txt
+          fi
+          [ -f state.json ] && git add state.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Обновление состояния" --quiet
+            git push --quiet
+          fi
