@@ -120,56 +120,130 @@ def send_file(filename, content, reply_to=None):
 
 # ---------------------------------------------------------------- разбор письма
 
-class _HTMLToText(HTMLParser):
-    BLOCK = {"br", "p", "div", "tr", "li", "h1", "h2", "h3", "h4", "table", "blockquote"}
+# Невидимые символы, которыми рассылки делают отступы и прячут «прехедер»
+INVISIBLE_RE = re.compile("[­͏؜ᅟᅠ឴឵᠎"
+                          "​-‏‪-‮⁠-⁯⠀ㅤ﻿ﾠ]")
+SKIP_TAGS = {"script", "style", "head", "title"}
+BLOCK_TAGS = {"br", "p", "div", "tr", "table", "h1", "h2", "h3", "h4", "h5", "h6",
+              "blockquote", "ul", "ol", "section", "header", "footer", "center", "hr"}
+
+
+def strip_invisible(text):
+    return INVISIBLE_RE.sub("", text.replace("\xa0", " "))
+
+
+class _HTMLToTelegram(HTMLParser):
+    """Превращает HTML письма в текст для Telegram: строки + ссылки <a>."""
 
     def __init__(self):
-        super().__init__()
-        self.parts = []
+        super().__init__(convert_charrefs=True)
+        self.parts = []      # уже экранированные куски
         self.skip = 0
+        self.links = []      # стек: (href, индекс начала в parts)
 
     def handle_starttag(self, tag, attrs):
-        if tag in ("script", "style", "head"):
+        if tag in SKIP_TAGS:
             self.skip += 1
-        elif tag in self.BLOCK:
+        elif tag in BLOCK_TAGS:
             self.parts.append("\n")
+        elif tag == "li":
+            self.parts.append("\n• ")
+        elif tag in ("td", "th"):
+            self.parts.append(" ")
+        elif tag == "a":
+            href = (dict(attrs).get("href") or "").strip()
+            if not re.match(r"(https?://|mailto:)", href, re.I):
+                href = ""
+            self.links.append((href, len(self.parts)))
 
     def handle_endtag(self, tag):
-        if tag in ("script", "style", "head") and self.skip:
-            self.skip -= 1
-        elif tag in self.BLOCK:
+        if tag in SKIP_TAGS:
+            self.skip = max(0, self.skip - 1)
+        elif tag in BLOCK_TAGS or tag == "li":
             self.parts.append("\n")
+        elif tag == "a" and self.links:
+            href, start = self.links.pop()
+            inner = re.sub(r"\s+", " ", "".join(self.parts[start:])).strip()
+            del self.parts[start:]
+            if href and inner and "<a " not in inner:
+                self.parts.append(f' <a href="{html.escape(href, quote=True)}">{inner}</a> ')
+            elif inner:
+                self.parts.append(f" {inner} ")
 
     def handle_data(self, data):
-        if not self.skip:
-            self.parts.append(data)
+        if self.skip:
+            return
+        text = re.sub(r"\s+", " ", strip_invisible(data))
+        if text:
+            self.parts.append(html.escape(text, quote=False))
 
 
-def html_to_text(raw):
-    parser = _HTMLToText()
+def tidy_lines(text):
+    """Убирает пустые и «пустотные» строки, приклеивает огрызки вроде «₽»."""
+    lines = []
+    for line in text.split("\n"):
+        line = re.sub(r"[ \t]+", " ", line).strip()
+        visible = re.sub(r"<[^>]+>", "", line).strip()
+        if not visible or not re.search(r"\w", visible):
+            if visible in ("•",) or not visible:
+                continue
+        if lines and len(visible) <= 2 and "<a " not in line:
+            lines[-1] += " " + line
+        else:
+            lines.append(line)
+    return lines
+
+
+def html_body_lines(raw):
+    parser = _HTMLToTelegram()
     parser.feed(raw)
-    return "".join(parser.parts)
+    parser.close()
+    return tidy_lines("".join(parser.parts))
 
 
-def clean_text(text):
-    text = text.replace("\r", "").replace("\xa0", " ")
-    text = re.sub(r"[ \t]+", " ", text)
+def plain_body_lines(raw):
+    text = strip_invisible(raw.replace("\r", ""))
     text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
-    return text.strip()
+    lines = [html.escape(re.sub(r"[ \t]+", " ", l).rstrip(), quote=False)
+             for l in text.strip().split("\n")]
+    return lines
 
 
-def get_body(msg):
-    part = msg.get_body(preferencelist=("plain", "html"))
-    if part is None:
-        return ""
+def part_text(part):
     try:
-        text = part.get_content()
+        return part.get_content()
     except Exception:
         payload = part.get_payload(decode=True) or b""
-        text = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
-    if part.get_content_type() == "text/html":
-        text = html_to_text(text)
-    return clean_text(text)
+        return payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+
+
+def get_body_lines(msg):
+    """Строки текста письма в формате Telegram HTML (уже экранированы)."""
+    html_part = msg.get_body(preferencelist=("html",))
+    if html_part is not None:
+        lines = html_body_lines(part_text(html_part))
+        if lines:
+            return lines
+    plain_part = msg.get_body(preferencelist=("plain",))
+    if plain_part is not None:
+        return plain_body_lines(part_text(plain_part))
+    return []
+
+
+def limit_lines(lines, limit):
+    """Обрезает текст по целым строкам, не ломая HTML-теги."""
+    out, total = [], 0
+    for line in lines:
+        if total + len(line) + 1 > limit:
+            room = limit - total
+            plain = html.unescape(re.sub(r"<[^>]+>", "", line))
+            if room > 80:
+                out.append(html.escape(plain[:room - 20].rstrip(), quote=False) + "…")
+            out.append("…\n<i>[письмо обрезано, полный текст — в почте]</i>")
+            break
+        out.append(line)
+        total += len(line) + 1
+    return "\n".join(out)
 
 
 def get_attachments(msg):
@@ -197,29 +271,45 @@ def format_date(msg):
         return ""
 
 
-def build_message(msg):
-    subject = str(msg.get("Subject") or "(без темы)").strip()
-    sender = str(msg.get("From") or "").strip()
+def build_header(msg):
+    subject = strip_invisible(str(msg.get("Subject") or "(без темы)")).strip()
+    sender = strip_invisible(str(msg.get("From") or "")).strip()
     date = format_date(msg)
-    body = get_body(msg)
-
-    if len(body) > BODY_LIMIT:
-        body = body[:BODY_LIMIT].rstrip() + "\n…\n[письмо обрезано, полный текст — в почте]"
-
     lines = [f"📧 <b>{html.escape(subject)}</b>"]
     if sender:
         lines.append(f"От: {html.escape(sender)}")
     if date:
         lines.append(f"Дата: {date}")
-    text = "\n".join(lines)
+    return "\n".join(lines)
+
+
+def build_message(msg):
+    text = build_header(msg)
+    body = limit_lines(get_body_lines(msg), BODY_LIMIT)
     if body:
-        text += "\n\n" + html.escape(body)
-    return text[:TG_TEXT_LIMIT]
+        text += "\n\n" + body
+    return text
+
+
+def to_plain(text):
+    """Запасной вариант без разметки, если Telegram не принял HTML."""
+    text = re.sub(r'<a href="([^"]*)">(.*?)</a>', r"\2 (\1)", text)
+    return html.unescape(re.sub(r"<[^>]+>", "", text))[:TG_TEXT_LIMIT]
 
 
 def forward(raw_bytes):
     msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
-    sent = send_text(build_message(msg))
+    text = build_message(msg)
+    try:
+        sent = send_text(text)
+    except RuntimeError as err:
+        if "parse" not in str(err).lower() and "too long" not in str(err).lower():
+            raise
+        sent = tg_call("sendMessage", {
+            "chat_id": TG_CHAT_ID,
+            "text": to_plain(text),
+            "disable_web_page_preview": "true",
+        })
     reply_to = sent["message_id"]
 
     for filename, content in get_attachments(msg):
