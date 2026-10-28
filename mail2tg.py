@@ -26,6 +26,7 @@
 """
 
 import email
+import email.header
 import email.policy
 import email.utils
 import html
@@ -134,50 +135,138 @@ def strip_invisible(text):
     return INVISIBLE_RE.sub("", text.replace("\xa0", " "))
 
 
+CELL_SEP = " | "        # разделитель ячеек в строке таблицы
+ROW_MAX_LEN = 300       # строки длиннее считаем вёрсткой, а не таблицей
+
+
 class _HTMLToTelegram(HTMLParser):
-    """Превращает HTML письма в текст для Telegram: строки + ссылки <a>."""
+    """Превращает HTML письма в текст для Telegram: строки + ссылки <a>.
+
+    Ячейки одной строки таблицы собираются в одну строку через « | ».
+    Если ячейки большие (вёрстка письма, а не таблица с данными) —
+    их содержимое выводится друг под другом.
+    """
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.parts = []      # уже экранированные куски
+        self.bufs = [[]]     # стек буферов: основной текст и открытые ячейки
+        self.rows = []       # стек открытых строк таблиц: {"cells": [...], "cell": bool}
+        self.tables = []     # для каждой открытой <table> — сколько строк было открыто до неё
         self.skip = 0
-        self.links = []      # стек: (href, индекс начала в parts)
+        self.links = []      # стек: (href, буфер, индекс начала)
 
+    # -- буферы и таблицы
+    @property
+    def buf(self):
+        return self.bufs[-1]
+
+    def open_cell(self):
+        if not self.rows:
+            self.rows.append({"cells": [], "cell": False})
+        if self.rows[-1]["cell"]:
+            self.close_cell()
+        self.bufs.append([])
+        self.rows[-1]["cell"] = True
+
+    def close_cell(self):
+        row = self.rows[-1]
+        if not row["cell"]:
+            return
+        lines = tidy_lines("".join(self.bufs.pop()))
+        row["cell"] = False
+        if lines:
+            row["cells"].append(lines)
+
+    def open_row(self):
+        if self.rows and not self.rows[-1]["cell"] and (
+                not self.tables or len(self.rows) > self.tables[-1]):
+            self.close_row()          # предыдущая строка не была закрыта
+        self.rows.append({"cells": [], "cell": False})
+
+    def close_row(self):
+        if not self.rows:
+            return
+        if self.rows[-1]["cell"]:
+            self.close_cell()
+        cells = self.rows.pop()["cells"]
+        if not cells:
+            return
+        flat = [" ".join(lines) for lines in cells]
+        is_data_row = (
+            len(cells) > 1
+            and all(len(lines) <= 3 for lines in cells)
+            and sum(visible_len(c) for c in flat) <= ROW_MAX_LEN
+        )
+        if is_data_row:
+            text = CELL_SEP.join(flat)
+        else:
+            text = "\n".join(line for lines in cells for line in lines)
+        self.buf.append("\n" + text + "\n")
+
+    def close_tables_to(self, depth):
+        while len(self.rows) > depth:
+            self.close_row()
+
+    # -- разбор
     def handle_starttag(self, tag, attrs):
         if tag in SKIP_TAGS:
             self.skip += 1
-        elif tag in BLOCK_TAGS:
-            self.parts.append("\n")
-        elif tag == "li":
-            self.parts.append("\n• ")
+        elif tag == "table":
+            self.buf.append("\n")
+            self.tables.append(len(self.rows))
+        elif tag == "tr":
+            self.open_row()
         elif tag in ("td", "th"):
-            self.parts.append(" ")
+            self.open_cell()
+        elif tag in BLOCK_TAGS:
+            self.buf.append("\n")
+        elif tag == "li":
+            self.buf.append("\n• ")
         elif tag == "a":
             href = (dict(attrs).get("href") or "").strip()
             if not re.match(r"(https?://|mailto:)", href, re.I):
                 href = ""
-            self.links.append((href, len(self.parts)))
+            self.links.append((href, self.buf, len(self.buf)))
 
     def handle_endtag(self, tag):
         if tag in SKIP_TAGS:
             self.skip = max(0, self.skip - 1)
+        elif tag == "table":
+            if self.tables:
+                self.close_tables_to(self.tables.pop())
+            self.buf.append("\n")
+        elif tag == "tr":
+            if self.rows and (not self.tables or len(self.rows) > self.tables[-1]):
+                self.close_row()
+        elif tag in ("td", "th"):
+            if self.rows:
+                self.close_cell()
         elif tag in BLOCK_TAGS or tag == "li":
-            self.parts.append("\n")
+            self.buf.append("\n")
         elif tag == "a" and self.links:
-            href, start = self.links.pop()
-            inner = re.sub(r"\s+", " ", "".join(self.parts[start:])).strip()
-            del self.parts[start:]
+            href, buf, start = self.links.pop()
+            if buf is not self.buf:
+                return                # ссылка «перешагнула» ячейку — оставляем как есть
+            inner = re.sub(r"\s+", " ", "".join(buf[start:])).strip()
+            del buf[start:]
             if href and inner and "<a " not in inner:
-                self.parts.append(f' <a href="{html.escape(href, quote=True)}">{inner}</a> ')
+                buf.append(f' <a href="{html.escape(href, quote=True)}">{inner}</a> ')
             elif inner:
-                self.parts.append(f" {inner} ")
+                buf.append(f" {inner} ")
 
     def handle_data(self, data):
         if self.skip:
             return
         text = re.sub(r"\s+", " ", strip_invisible(data))
         if text:
-            self.parts.append(html.escape(text, quote=False))
+            self.buf.append(html.escape(text, quote=False))
+
+    def result(self):
+        self.close_tables_to(0)
+        while len(self.bufs) > 1:     # незакрытые ячейки без строк
+            inner = self.bufs.pop()
+            self.buf.extend(inner)
+        return "".join(self.bufs[0])
 
 
 def tidy_lines(text):
@@ -186,10 +275,9 @@ def tidy_lines(text):
     for line in text.split("\n"):
         line = re.sub(r"[ \t]+", " ", line).strip()
         visible = re.sub(r"<[^>]+>", "", line).strip()
-        if not visible or not re.search(r"\w", visible):
-            if visible in ("•",) or not visible:
-                continue
-        if lines and len(visible) <= 2 and "<a " not in line:
+        if not visible or visible == "•":
+            continue
+        if lines and len(visible) <= 2 and "<a " not in line and CELL_SEP.strip() not in line:
             lines[-1] += " " + line
         else:
             lines.append(line)
@@ -200,7 +288,7 @@ def html_body_lines(raw):
     parser = _HTMLToTelegram()
     parser.feed(raw)
     parser.close()
-    return tidy_lines("".join(parser.parts))
+    return tidy_lines(parser.result())
 
 
 def plain_body_lines(raw):
@@ -296,9 +384,33 @@ def format_date(msg):
         return ""
 
 
-def build_header(msg):
-    subject = strip_invisible(str(msg.get("Subject") or "(без темы)")).strip()
-    sender = strip_invisible(str(msg.get("From") or "")).strip()
+def decode_hdr(raw_msg, name):
+    """Декодирует заголовок письма.
+
+    Рассылки часто режут длинное имя на куски посреди слова
+    (=?utf-8?B?...?= =?utf-8?B?...?=). Куски нужно склеить без пробелов,
+    иначе получается «гипермар кет цифрово й».
+    """
+    value = raw_msg.get(name)
+    if not value:
+        return ""
+    value = re.sub(r"\r?\n[ \t]+", " ", str(value))
+    # пробелы между соседними закодированными кусками (даже внутри кавычек) убираем
+    value = re.sub(r"(\?=)\s+(=\?)", r"\1\2", value)
+    try:
+        text = str(email.header.make_header(email.header.decode_header(value)))
+    except Exception:
+        text = value
+    return strip_invisible(re.sub(r"\s+", " ", text)).strip()
+
+
+def build_header(msg, raw_msg):
+    subject = decode_hdr(raw_msg, "Subject") or "(без темы)"
+    sender = decode_hdr(raw_msg, "From")
+    name, addr = email.utils.parseaddr(sender)
+    if addr:
+        name = name.strip(' "\'')
+        sender = f"{name} <{addr}>" if name else addr
     date = format_date(msg)
     lines = [f"📧 <b>{html.escape(subject)}</b>"]
     if sender:
@@ -308,8 +420,8 @@ def build_header(msg):
     return "\n".join(lines)
 
 
-def build_messages(msg):
-    return split_parts(build_header(msg), get_body_lines(msg))
+def build_messages(msg, raw_msg):
+    return split_parts(build_header(msg, raw_msg), get_body_lines(msg))
 
 
 def to_plain(text):
@@ -320,8 +432,9 @@ def to_plain(text):
 
 def forward(raw_bytes):
     msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
+    raw_msg = email.message_from_bytes(raw_bytes, policy=email.policy.compat32)
     reply_to = None
-    for text in build_messages(msg):
+    for text in build_messages(msg, raw_msg):
         try:
             sent = send_text(text, reply_to=reply_to)
         except RuntimeError as err:
