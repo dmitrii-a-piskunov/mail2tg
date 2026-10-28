@@ -135,23 +135,104 @@ def strip_invisible(text):
     return INVISIBLE_RE.sub("", text.replace("\xa0", " "))
 
 
-CELL_SEP = " | "        # разделитель ячеек в строке таблицы
+CELL_SEP = " | "        # разделитель ячеек, когда таблицу не удалось разобрать
 ROW_MAX_LEN = 300       # строки длиннее считаем вёрсткой, а не таблицей
+HEADER_CELL_MAX = 30    # ячейка заголовка таблицы — короткий текст
+NARROW_ROW = 40         # строки таблицы не длиннее — оставляем как есть через « | »
+HREF_RE = re.compile(r'href="([^"]*)"')
+
+
+def is_link_cell(cell):
+    cell = cell.strip()
+    return cell.startswith("<a ") and cell.endswith("</a>") and cell.count("<a ") == 1
+
+
+def looks_like_header(cells):
+    return all(
+        "<a " not in c and visible_len(c) <= HEADER_CELL_MAX and not re.search(r"\d", c)
+        for c in cells
+    )
+
+
+def render_table_rows(rows):
+    """Превращает строки таблицы с данными в удобный для телефона текст.
+
+    rows — список (ячейки, строка_заголовка), ячейки уже в формате Telegram HTML.
+    """
+    out = []
+    if not rows:
+        return out
+    first, first_is_th = rows[0]
+    n = len(first)
+
+    # 0) Узкая таблица (короткое расписание и т.п.) — строками через « | »,
+    #    так она и на телефоне читается как таблица.
+    has_header = len(rows) >= 2 and n >= 2 and (first_is_th or looks_like_header(first))
+    key_value = not has_header and all(len(cells) == 2 for cells, _ in rows)
+    if not key_value and all(visible_len(CELL_SEP.join(cells)) <= NARROW_ROW for cells, _ in rows):
+        if has_header:
+            out.append("<b>" + CELL_SEP.join(first) + "</b>")
+            rows = rows[1:]
+        out.extend(CELL_SEP.join(cells) for cells, _ in rows)
+        return out
+
+    # 1) Таблица с заголовком: каждая строка — карточка с подписями.
+    #    • Патч-корд Cablexpert
+    #    Кол-во: 1 шт. · Цена: 370 ₽ · Сумма: 370 ₽
+    if len(rows) >= 2 and (first_is_th or looks_like_header(first)):
+        headers = first
+        for cells, _ in rows[1:]:
+            if len(cells) == n:
+                out.append("• " + cells[0])
+                details = [f"{h}: {v}" for h, v in zip(headers[1:], cells[1:]) if v]
+                if details:
+                    out.append(" · ".join(details))
+            else:
+                out.append(" ".join(cells))
+        return out
+
+    # 2) Товары/новости колонками: первая строка — ссылки, ниже — их цены и кнопки.
+    #    Перестраиваем «по колонкам», дубли ссылок («Подробнее») убираем.
+    if (len(rows) >= 2 and n >= 2 and all(is_link_cell(c) for c in first)
+            and all(len(cells) == n for cells, _ in rows)):
+        for j in range(n):
+            name = first[j]
+            seen = set(HREF_RE.findall(name))
+            extra = []
+            for cells, _ in rows[1:]:
+                cell = cells[j]
+                hrefs = set(HREF_RE.findall(cell))
+                if hrefs and hrefs <= seen:
+                    continue
+                seen |= hrefs
+                extra.append(cell)
+            out.append("• " + name)
+            if extra:
+                out.append(" · ".join(extra))
+        return out
+
+    # 3) Остальное: пары «ключ: значение» или ячейки через « | ».
+    for cells, _ in rows:
+        key = cells[0].strip()
+        if len(cells) == 2 and "<a " not in key and visible_len(key) <= HEADER_CELL_MAX:
+            out.append(key + (" " if key.endswith(":") else ": ") + cells[1])
+        else:
+            out.append(CELL_SEP.join(cells))
+    return out
 
 
 class _HTMLToTelegram(HTMLParser):
     """Превращает HTML письма в текст для Telegram: строки + ссылки <a>.
 
-    Ячейки одной строки таблицы собираются в одну строку через « | ».
-    Если ячейки большие (вёрстка письма, а не таблица с данными) —
-    их содержимое выводится друг под другом.
+    Небольшие таблицы с данными собираются в карточки (render_table_rows).
+    Большие ячейки (вёрстка письма, а не таблица) выводятся друг под другом.
     """
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.bufs = [[]]     # стек буферов: основной текст и открытые ячейки
-        self.rows = []       # стек открытых строк таблиц: {"cells": [...], "cell": bool}
-        self.tables = []     # для каждой открытой <table> — сколько строк было открыто до неё
+        self.rows = []       # стек открытых строк: {"cells": [(строки, th)], "cell": bool, "th": bool}
+        self.tables = []     # стек открытых таблиц: {"depth": строк до неё, "items": [...]}
         self.skip = 0
         self.links = []      # стек: (href, буфер, индекс начала)
 
@@ -160,13 +241,17 @@ class _HTMLToTelegram(HTMLParser):
     def buf(self):
         return self.bufs[-1]
 
-    def open_cell(self):
-        if not self.rows:
-            self.rows.append({"cells": [], "cell": False})
+    def row_in_table(self):
+        return not self.tables or len(self.rows) > self.tables[-1]["depth"]
+
+    def open_cell(self, tag):
+        if not self.rows or not self.row_in_table():
+            self.rows.append({"cells": [], "cell": False, "th": False})
         if self.rows[-1]["cell"]:
             self.close_cell()
         self.bufs.append([])
         self.rows[-1]["cell"] = True
+        self.rows[-1]["th"] = tag == "th"
 
     def close_cell(self):
         row = self.rows[-1]
@@ -175,13 +260,12 @@ class _HTMLToTelegram(HTMLParser):
         lines = tidy_lines("".join(self.bufs.pop()))
         row["cell"] = False
         if lines:
-            row["cells"].append(lines)
+            row["cells"].append((lines, row["th"]))
 
     def open_row(self):
-        if self.rows and not self.rows[-1]["cell"] and (
-                not self.tables or len(self.rows) > self.tables[-1]):
+        if self.rows and not self.rows[-1]["cell"] and self.row_in_table():
             self.close_row()          # предыдущая строка не была закрыта
-        self.rows.append({"cells": [], "cell": False})
+        self.rows.append({"cells": [], "cell": False, "th": False})
 
     def close_row(self):
         if not self.rows:
@@ -191,21 +275,43 @@ class _HTMLToTelegram(HTMLParser):
         cells = self.rows.pop()["cells"]
         if not cells:
             return
-        flat = [" ".join(lines) for lines in cells]
+        flat = [" ".join(lines) for lines, _ in cells]
         is_data_row = (
             len(cells) > 1
-            and all(len(lines) <= 3 for lines in cells)
+            and all(len(lines) <= 3 for lines, _ in cells)
             and sum(visible_len(c) for c in flat) <= ROW_MAX_LEN
         )
         if is_data_row:
-            text = CELL_SEP.join(flat)
+            item = ("data", flat, all(th for _, th in cells))
         else:
-            text = "\n".join(line for lines in cells for line in lines)
-        self.buf.append("\n" + text + "\n")
+            item = ("text", "\n".join(line for lines, _ in cells for line in lines))
 
-    def close_tables_to(self, depth):
-        while len(self.rows) > depth:
+        table = self.tables[-1] if self.tables else None
+        if table is not None and len(self.rows) == table["depth"]:
+            table["items"].append(item)
+        else:
+            self.emit_items([item])
+
+    def emit_items(self, items):
+        """Выводит строки таблицы, группируя подряд идущие строки с данными."""
+        lines, group = [], []
+        for item in items + [("text", None)]:
+            if item[0] == "data":
+                group.append((item[1], item[2]))
+                continue
+            lines.extend(render_table_rows(group))
+            group = []
+            if item[1]:
+                lines.append(item[1])
+        if lines:
+            self.buf.append("\n" + "\n".join(lines) + "\n")
+
+    def close_table(self):
+        table = self.tables[-1]
+        while len(self.rows) > table["depth"]:
             self.close_row()
+        self.tables.pop()
+        self.emit_items(table["items"])
 
     # -- разбор
     def handle_starttag(self, tag, attrs):
@@ -213,11 +319,11 @@ class _HTMLToTelegram(HTMLParser):
             self.skip += 1
         elif tag == "table":
             self.buf.append("\n")
-            self.tables.append(len(self.rows))
+            self.tables.append({"depth": len(self.rows), "items": []})
         elif tag == "tr":
             self.open_row()
         elif tag in ("td", "th"):
-            self.open_cell()
+            self.open_cell(tag)
         elif tag in BLOCK_TAGS:
             self.buf.append("\n")
         elif tag == "li":
@@ -233,10 +339,10 @@ class _HTMLToTelegram(HTMLParser):
             self.skip = max(0, self.skip - 1)
         elif tag == "table":
             if self.tables:
-                self.close_tables_to(self.tables.pop())
+                self.close_table()
             self.buf.append("\n")
         elif tag == "tr":
-            if self.rows and (not self.tables or len(self.rows) > self.tables[-1]):
+            if self.rows and self.row_in_table():
                 self.close_row()
         elif tag in ("td", "th"):
             if self.rows:
@@ -262,7 +368,10 @@ class _HTMLToTelegram(HTMLParser):
             self.buf.append(html.escape(text, quote=False))
 
     def result(self):
-        self.close_tables_to(0)
+        while self.tables:
+            self.close_table()
+        while self.rows:
+            self.close_row()
         while len(self.bufs) > 1:     # незакрытые ячейки без строк
             inner = self.bufs.pop()
             self.buf.extend(inner)
