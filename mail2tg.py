@@ -43,7 +43,9 @@ import requests
 
 STATE_FILE = Path(__file__).with_name("state.json")
 TG_TEXT_LIMIT = 4096          # лимит Telegram на одно сообщение
-BODY_LIMIT = 3300             # сколько символов текста письма показывать
+PART_LIMIT = 3800             # видимых символов в одной части длинного письма
+RAW_LIMIT = 20000             # максимум символов разметки в одной части
+MAX_PARTS = 10                # больше частей не отправляем (защита от спама)
 TG_FILE_LIMIT = 50 * 1024 * 1024  # лимит Bot API на отправку файла
 
 
@@ -230,20 +232,43 @@ def get_body_lines(msg):
     return []
 
 
-def limit_lines(lines, limit):
-    """Обрезает текст по целым строкам, не ломая HTML-теги."""
-    out, total = [], 0
+def visible_len(line):
+    """Длина строки так, как её считает Telegram: без тегов и адресов ссылок."""
+    return len(html.unescape(re.sub(r"<[^>]+>", "", line)))
+
+
+def split_long_line(line, limit):
+    """Очень длинную строку без разметки режет на куски."""
+    if visible_len(line) <= limit:
+        return [line]
+    plain = html.unescape(re.sub(r"<[^>]+>", "", line))
+    return [html.escape(plain[i:i + limit], quote=False) for i in range(0, len(plain), limit)]
+
+
+def split_parts(header, lines):
+    """Делит письмо на части, каждая влезает в одно сообщение Telegram."""
+    parts, current = [], [header, ""]
+    size, raw = visible_len(header) + 1, len(header) + 1
     for line in lines:
-        if total + len(line) + 1 > limit:
-            room = limit - total
-            plain = html.unescape(re.sub(r"<[^>]+>", "", line))
-            if room > 80:
-                out.append(html.escape(plain[:room - 20].rstrip(), quote=False) + "…")
-            out.append("…\n<i>[письмо обрезано, полный текст — в почте]</i>")
-            break
-        out.append(line)
-        total += len(line) + 1
-    return "\n".join(out)
+        for piece in split_long_line(line, PART_LIMIT - 100):
+            length = visible_len(piece) + 1
+            # второе условие — подстраховка от огромных адресов ссылок
+            if size + length > PART_LIMIT or raw + len(piece) > RAW_LIMIT:
+                parts.append("\n".join(current).strip())
+                current, size, raw = [], 0, 0
+            current.append(piece)
+            size += length
+            raw += len(piece) + 1
+    if current:
+        parts.append("\n".join(current).strip())
+    parts = [p for p in parts if p]
+
+    if len(parts) > MAX_PARTS:
+        parts = parts[:MAX_PARTS]
+        parts[-1] += "\n…\n<i>[письмо очень длинное, продолжение — в почте]</i>"
+    if len(parts) > 1:
+        parts = [f"{p}\n\n<i>(часть {i} из {len(parts)})</i>" for i, p in enumerate(parts, 1)]
+    return parts
 
 
 def get_attachments(msg):
@@ -283,12 +308,8 @@ def build_header(msg):
     return "\n".join(lines)
 
 
-def build_message(msg):
-    text = build_header(msg)
-    body = limit_lines(get_body_lines(msg), BODY_LIMIT)
-    if body:
-        text += "\n\n" + body
-    return text
+def build_messages(msg):
+    return split_parts(build_header(msg), get_body_lines(msg))
 
 
 def to_plain(text):
@@ -299,18 +320,21 @@ def to_plain(text):
 
 def forward(raw_bytes):
     msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
-    text = build_message(msg)
-    try:
-        sent = send_text(text)
-    except RuntimeError as err:
-        if "parse" not in str(err).lower() and "too long" not in str(err).lower():
-            raise
-        sent = tg_call("sendMessage", {
-            "chat_id": TG_CHAT_ID,
-            "text": to_plain(text),
-            "disable_web_page_preview": "true",
-        })
-    reply_to = sent["message_id"]
+    reply_to = None
+    for text in build_messages(msg):
+        try:
+            sent = send_text(text, reply_to=reply_to)
+        except RuntimeError as err:
+            if "parse" not in str(err).lower() and "too long" not in str(err).lower():
+                raise
+            data = {"chat_id": TG_CHAT_ID, "text": to_plain(text),
+                    "disable_web_page_preview": "true"}
+            if reply_to:
+                data["reply_to_message_id"] = reply_to
+            sent = tg_call("sendMessage", data)
+        if reply_to is None:
+            reply_to = sent["message_id"]   # продолжение и файлы — ответом на первую часть
+        time.sleep(1)
 
     for filename, content in get_attachments(msg):
         if len(content) > TG_FILE_LIMIT:
