@@ -874,10 +874,28 @@ def to_plain(text):
     return html.unescape(re.sub(r"<[^>]+>", "", text))[:TG_TEXT_LIMIT]
 
 
+def fallback_entries(msg):
+    """Самый простой текст письма: plain-часть или HTML без тегов."""
+    try:
+        part = msg.get_body(preferencelist=("plain", "html"))
+        text = part_text(part) if part is not None else ""
+        if part is not None and part.get_content_type() == "text/html":
+            text = re.sub(r"(?is)<(script|style|head).*?</\1>", " ", text)
+            text = html.unescape(re.sub(r"<[^>]+>", "\n", text))
+        return plain_entries(text)
+    except Exception:
+        return [("<i>Текст письма не удалось прочитать — откройте его в почте.</i>", "text", False)]
+
+
 def forward(raw_bytes):
     msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
     raw_msg = email.message_from_bytes(raw_bytes, policy=email.policy.compat32)
-    entries, raw_html, has_table = get_body(msg)
+    try:
+        entries, raw_html, has_table = get_body(msg)
+    except Exception as err:
+        # необычный HTML не должен ломать пересылку — отправляем упрощённый текст
+        print(f"Не удалось разобрать письмо ({type(err).__name__}), отправляю упрощённо.")
+        entries, raw_html, has_table = fallback_entries(msg), None, False
     reply_to = None
     for text in build_messages(msg, raw_msg, entries):
         try:
@@ -1111,8 +1129,18 @@ def main():
             typ, fetched = imap.uid("fetch", str(uid), "(BODY.PEEK[])")
             raw = next((item[1] for item in fetched if isinstance(item, tuple)), None)
             if raw:
-                forward(raw)
-                sent += 1
+                try:
+                    forward(raw)
+                    sent += 1
+                except requests.RequestException:
+                    raise                   # нет связи с Telegram — попробуем в следующий запуск
+                except Exception as err:
+                    # одно «сломанное» письмо не должно останавливать бота навсегда
+                    print(f"Письмо не переслано: {type(err).__name__}: {str(err)[:200]}")
+                    try:
+                        send_text("⚠️ Одно письмо не удалось переслать — откройте почту.")
+                    except Exception:
+                        pass
             # сохраняем после каждого письма, чтобы при сбое не было дублей
             state["last_uid"] = uid
             save_state(state)
