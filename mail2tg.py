@@ -18,6 +18,8 @@
   IMAP_FOLDER    — по умолчанию INBOX
   TZ_NAME        — часовой пояс для даты письма, по умолчанию Europe/Samara
   MAX_PER_RUN    — сколько писем максимум за один запуск, по умолчанию 20
+  SCREENSHOTS    — картинка письма: auto (только письма с таблицами, по умолчанию),
+                   always (всегда) или off (никогда)
   BACKFILL_SINCE — дата (2026-09-01 или 01.09.2026): переслать все письма,
                    пришедшие начиная с этого дня. Задаётся при ручном запуске.
 
@@ -68,6 +70,8 @@ TG_CHAT_ID = env("TG_CHAT_ID")
 TZ = ZoneInfo(env("TZ_NAME", "Europe/Samara"))
 MAX_PER_RUN = int(env("MAX_PER_RUN", required=False) or "20")
 BACKFILL_SINCE = (os.environ.get("BACKFILL_SINCE") or "").strip()
+# Скриншот письма: auto — только для писем с таблицами, always — всегда, off — никогда
+SCREENSHOTS = (os.environ.get("SCREENSHOTS") or "auto").strip().lower()
 
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 
@@ -135,106 +139,26 @@ def strip_invisible(text):
     return INVISIBLE_RE.sub("", text.replace("\xa0", " "))
 
 
-CELL_SEP = " | "        # разделитель ячеек, когда таблицу не удалось разобрать
-ROW_MAX_LEN = 300       # строки длиннее считаем вёрсткой, а не таблицей
-HEADER_CELL_MAX = 30    # ячейка заголовка таблицы — короткий текст
-NARROW_ROW = 40         # строки таблицы не длиннее — оставляем как есть через « | »
-HREF_RE = re.compile(r'href="([^"]*)"')
-
-
-def is_link_cell(cell):
-    cell = cell.strip()
-    return cell.startswith("<a ") and cell.endswith("</a>") and cell.count("<a ") == 1
-
-
-def looks_like_header(cells):
-    return all(
-        "<a " not in c and visible_len(c) <= HEADER_CELL_MAX and not re.search(r"\d", c)
-        for c in cells
-    )
-
-
-def render_table_rows(rows):
-    """Превращает строки таблицы с данными в удобный для телефона текст.
-
-    rows — список (ячейки, строка_заголовка), ячейки уже в формате Telegram HTML.
-    """
-    out = []
-    if not rows:
-        return out
-    first, first_is_th = rows[0]
-    n = len(first)
-
-    # 0) Узкая таблица (короткое расписание и т.п.) — строками через « | »,
-    #    так она и на телефоне читается как таблица.
-    has_header = len(rows) >= 2 and n >= 2 and (first_is_th or looks_like_header(first))
-    key_value = not has_header and all(len(cells) == 2 for cells, _ in rows)
-    if not key_value and all(visible_len(CELL_SEP.join(cells)) <= NARROW_ROW for cells, _ in rows):
-        if has_header:
-            out.append("<b>" + CELL_SEP.join(first) + "</b>")
-            rows = rows[1:]
-        out.extend(CELL_SEP.join(cells) for cells, _ in rows)
-        return out
-
-    # 1) Таблица с заголовком: каждая строка — карточка с подписями.
-    #    • Патч-корд Cablexpert
-    #    Кол-во: 1 шт. · Цена: 370 ₽ · Сумма: 370 ₽
-    if len(rows) >= 2 and (first_is_th or looks_like_header(first)):
-        headers = first
-        for cells, _ in rows[1:]:
-            if len(cells) == n:
-                out.append("• " + cells[0])
-                details = [f"{h}: {v}" for h, v in zip(headers[1:], cells[1:]) if v]
-                if details:
-                    out.append(" · ".join(details))
-            else:
-                out.append(" ".join(cells))
-        return out
-
-    # 2) Товары/новости колонками: первая строка — ссылки, ниже — их цены и кнопки.
-    #    Перестраиваем «по колонкам», дубли ссылок («Подробнее») убираем.
-    if (len(rows) >= 2 and n >= 2 and all(is_link_cell(c) for c in first)
-            and all(len(cells) == n for cells, _ in rows)):
-        for j in range(n):
-            name = first[j]
-            seen = set(HREF_RE.findall(name))
-            extra = []
-            for cells, _ in rows[1:]:
-                cell = cells[j]
-                hrefs = set(HREF_RE.findall(cell))
-                if hrefs and hrefs <= seen:
-                    continue
-                seen |= hrefs
-                extra.append(cell)
-            out.append("• " + name)
-            if extra:
-                out.append(" · ".join(extra))
-        return out
-
-    # 3) Остальное: пары «ключ: значение» или ячейки через « | ».
-    for cells, _ in rows:
-        key = cells[0].strip()
-        if len(cells) == 2 and "<a " not in key and visible_len(key) <= HEADER_CELL_MAX:
-            out.append(key + (" " if key.endswith(":") else ": ") + cells[1])
-        else:
-            out.append(CELL_SEP.join(cells))
-    return out
+ROW_SEP = "────────"     # разделитель между строками таблицы
+ROW_MAX_LEN = 300       # строки длиннее считаем вёрсткой, а не таблицей с данными
 
 
 class _HTMLToTelegram(HTMLParser):
     """Превращает HTML письма в текст для Telegram: строки + ссылки <a>.
 
-    Небольшие таблицы с данными собираются в карточки (render_table_rows).
-    Большие ячейки (вёрстка письма, а не таблица) выводятся друг под другом.
+    Строка таблицы с данными: каждая ячейка — отдельной строкой,
+    между строками таблицы — разделитель. Большие ячейки (вёрстка письма)
+    выводятся просто друг под другом.
     """
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.bufs = [[]]     # стек буферов: основной текст и открытые ячейки
-        self.rows = []       # стек открытых строк: {"cells": [(строки, th)], "cell": bool, "th": bool}
-        self.tables = []     # стек открытых таблиц: {"depth": строк до неё, "items": [...]}
+        self.rows = []       # стек открытых строк: {"cells": [...], "cell": bool}
+        self.tables = []     # для каждой открытой <table> — сколько строк было открыто до неё
         self.skip = 0
         self.links = []      # стек: (href, буфер, индекс начала)
+        self.has_table = False   # нашлась ли в письме таблица с данными
 
     # -- буферы и таблицы
     @property
@@ -242,16 +166,15 @@ class _HTMLToTelegram(HTMLParser):
         return self.bufs[-1]
 
     def row_in_table(self):
-        return not self.tables or len(self.rows) > self.tables[-1]["depth"]
+        return not self.tables or len(self.rows) > self.tables[-1]
 
-    def open_cell(self, tag):
+    def open_cell(self):
         if not self.rows or not self.row_in_table():
-            self.rows.append({"cells": [], "cell": False, "th": False})
+            self.rows.append({"cells": [], "cell": False})
         if self.rows[-1]["cell"]:
             self.close_cell()
         self.bufs.append([])
         self.rows[-1]["cell"] = True
-        self.rows[-1]["th"] = tag == "th"
 
     def close_cell(self):
         row = self.rows[-1]
@@ -260,12 +183,12 @@ class _HTMLToTelegram(HTMLParser):
         lines = tidy_lines("".join(self.bufs.pop()))
         row["cell"] = False
         if lines:
-            row["cells"].append((lines, row["th"]))
+            row["cells"].append(lines)
 
     def open_row(self):
         if self.rows and not self.rows[-1]["cell"] and self.row_in_table():
             self.close_row()          # предыдущая строка не была закрыта
-        self.rows.append({"cells": [], "cell": False, "th": False})
+        self.rows.append({"cells": [], "cell": False})
 
     def close_row(self):
         if not self.rows:
@@ -275,43 +198,22 @@ class _HTMLToTelegram(HTMLParser):
         cells = self.rows.pop()["cells"]
         if not cells:
             return
-        flat = [" ".join(lines) for lines, _ in cells]
+        flat = [" ".join(lines) for lines in cells]
         is_data_row = (
             len(cells) > 1
-            and all(len(lines) <= 3 for lines, _ in cells)
+            and all(len(lines) <= 3 for lines in cells)
             and sum(visible_len(c) for c in flat) <= ROW_MAX_LEN
         )
         if is_data_row:
-            item = ("data", flat, all(th for _, th in cells))
+            self.has_table = True
+            text = "\n".join([ROW_SEP] + flat + [ROW_SEP])
         else:
-            item = ("text", "\n".join(line for lines, _ in cells for line in lines))
+            text = "\n".join(line for lines in cells for line in lines)
+        self.buf.append("\n" + text + "\n")
 
-        table = self.tables[-1] if self.tables else None
-        if table is not None and len(self.rows) == table["depth"]:
-            table["items"].append(item)
-        else:
-            self.emit_items([item])
-
-    def emit_items(self, items):
-        """Выводит строки таблицы, группируя подряд идущие строки с данными."""
-        lines, group = [], []
-        for item in items + [("text", None)]:
-            if item[0] == "data":
-                group.append((item[1], item[2]))
-                continue
-            lines.extend(render_table_rows(group))
-            group = []
-            if item[1]:
-                lines.append(item[1])
-        if lines:
-            self.buf.append("\n" + "\n".join(lines) + "\n")
-
-    def close_table(self):
-        table = self.tables[-1]
-        while len(self.rows) > table["depth"]:
+    def close_rows_to(self, depth):
+        while len(self.rows) > depth:
             self.close_row()
-        self.tables.pop()
-        self.emit_items(table["items"])
 
     # -- разбор
     def handle_starttag(self, tag, attrs):
@@ -319,11 +221,11 @@ class _HTMLToTelegram(HTMLParser):
             self.skip += 1
         elif tag == "table":
             self.buf.append("\n")
-            self.tables.append({"depth": len(self.rows), "items": []})
+            self.tables.append(len(self.rows))
         elif tag == "tr":
             self.open_row()
         elif tag in ("td", "th"):
-            self.open_cell(tag)
+            self.open_cell()
         elif tag in BLOCK_TAGS:
             self.buf.append("\n")
         elif tag == "li":
@@ -339,7 +241,7 @@ class _HTMLToTelegram(HTMLParser):
             self.skip = max(0, self.skip - 1)
         elif tag == "table":
             if self.tables:
-                self.close_table()
+                self.close_rows_to(self.tables.pop())
             self.buf.append("\n")
         elif tag == "tr":
             if self.rows and self.row_in_table():
@@ -368,10 +270,7 @@ class _HTMLToTelegram(HTMLParser):
             self.buf.append(html.escape(text, quote=False))
 
     def result(self):
-        while self.tables:
-            self.close_table()
-        while self.rows:
-            self.close_row()
+        self.close_rows_to(0)
         while len(self.bufs) > 1:     # незакрытые ячейки без строк
             inner = self.bufs.pop()
             self.buf.extend(inner)
@@ -379,25 +278,35 @@ class _HTMLToTelegram(HTMLParser):
 
 
 def tidy_lines(text):
-    """Убирает пустые и «пустотные» строки, приклеивает огрызки вроде «₽»."""
+    """Убирает пустые строки и лишние разделители, приклеивает огрызки вроде «₽»."""
     lines = []
     for line in text.split("\n"):
         line = re.sub(r"[ \t]+", " ", line).strip()
         visible = re.sub(r"<[^>]+>", "", line).strip()
         if not visible or visible == "•":
             continue
-        if lines and len(visible) <= 2 and "<a " not in line and CELL_SEP.strip() not in line:
+        if line == ROW_SEP:
+            if lines and lines[-1] == ROW_SEP:
+                continue              # два разделителя подряд — оставляем один
+            lines.append(line)
+        elif lines and lines[-1] != ROW_SEP and len(visible) <= 2 and "<a " not in line:
             lines[-1] += " " + line
         else:
             lines.append(line)
     return lines
 
 
-def html_body_lines(raw):
+def parse_html(raw):
+    """Возвращает (строки текста, есть ли в письме таблица с данными)."""
     parser = _HTMLToTelegram()
     parser.feed(raw)
     parser.close()
-    return tidy_lines(parser.result())
+    lines = tidy_lines(parser.result())
+    while lines and lines[0] == ROW_SEP:
+        lines.pop(0)
+    while lines and lines[-1] == ROW_SEP:
+        lines.pop()
+    return lines, parser.has_table
 
 
 def plain_body_lines(raw):
@@ -416,17 +325,22 @@ def part_text(part):
         return payload.decode(part.get_content_charset() or "utf-8", errors="replace")
 
 
-def get_body_lines(msg):
-    """Строки текста письма в формате Telegram HTML (уже экранированы)."""
+def get_body(msg):
+    """Текст письма для Telegram.
+
+    Возвращает (строки в формате Telegram HTML, исходный HTML или None,
+    есть ли в письме таблица с данными).
+    """
     html_part = msg.get_body(preferencelist=("html",))
     if html_part is not None:
-        lines = html_body_lines(part_text(html_part))
+        raw_html = part_text(html_part)
+        lines, has_table = parse_html(raw_html)
         if lines:
-            return lines
+            return lines, raw_html, has_table
     plain_part = msg.get_body(preferencelist=("plain",))
     if plain_part is not None:
-        return plain_body_lines(part_text(plain_part))
-    return []
+        return plain_body_lines(part_text(plain_part)), None, False
+    return [], None, False
 
 
 def visible_len(line):
@@ -529,8 +443,8 @@ def build_header(msg, raw_msg):
     return "\n".join(lines)
 
 
-def build_messages(msg, raw_msg):
-    return split_parts(build_header(msg, raw_msg), get_body_lines(msg))
+def build_messages(msg, raw_msg, lines):
+    return split_parts(build_header(msg, raw_msg), lines)
 
 
 def to_plain(text):
@@ -542,8 +456,9 @@ def to_plain(text):
 def forward(raw_bytes):
     msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
     raw_msg = email.message_from_bytes(raw_bytes, policy=email.policy.compat32)
+    lines, raw_html, has_table = get_body(msg)
     reply_to = None
-    for text in build_messages(msg, raw_msg):
+    for text in build_messages(msg, raw_msg, lines):
         try:
             sent = send_text(text, reply_to=reply_to)
         except RuntimeError as err:
@@ -558,6 +473,9 @@ def forward(raw_bytes):
             reply_to = sent["message_id"]   # продолжение и файлы — ответом на первую часть
         time.sleep(1)
 
+    if raw_html and (SCREENSHOTS == "always" or (SCREENSHOTS == "auto" and has_table)):
+        send_screenshot(msg, raw_html, reply_to)
+
     for filename, content in get_attachments(msg):
         if len(content) > TG_FILE_LIMIT:
             send_text(
@@ -567,6 +485,106 @@ def forward(raw_bytes):
         else:
             send_file(filename, content, reply_to=reply_to)
         time.sleep(1)
+
+
+# ---------------------------------------------------------------- скриншот письма
+
+SHOT_WIDTH = 680            # ширина «окна», px (письма обычно свёрстаны под 600 px)
+SHOT_SCALE = 2              # чёткость картинки
+SHOT_CHUNK = 1800           # высота одного кадра, px (длинное письмо режется на кадры)
+SHOT_MAX = 10               # не больше 10 картинок (лимит альбома Telegram)
+
+
+def inline_cid_images(msg, raw_html):
+    """Подставляет в HTML картинки, вложенные в само письмо (src="cid:...")."""
+    import base64
+    for part in msg.walk():
+        cid = (part.get("Content-ID") or "").strip().strip("<>")
+        if not cid or part.get_content_maintype() != "image":
+            continue
+        data = part.get_payload(decode=True) or b""
+        uri = f"data:{part.get_content_type()};base64,{base64.b64encode(data).decode()}"
+        raw_html = raw_html.replace(f"cid:{cid}", uri)
+    return raw_html
+
+
+def png_size(png):
+    """Ширина и высота PNG без сторонних библиотек."""
+    return int.from_bytes(png[16:20], "big"), int.from_bytes(png[20:24], "big")
+
+
+def render_screenshots(page_html):
+    """Открывает письмо в браузере и возвращает список PNG-кадров."""
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        try:
+            browser = p.chromium.launch(channel="chrome")   # Chrome, предустановленный в GitHub
+        except Exception:
+            browser = p.chromium.launch()                   # Chromium от Playwright, если есть
+        try:
+            context = browser.new_context(
+                viewport={"width": SHOT_WIDTH, "height": 800},
+                device_scale_factor=SHOT_SCALE,
+                java_script_enabled=False,                    # скрипты из писем не выполняем
+            )
+            page = context.new_page()
+            try:
+                page.set_content(page_html, wait_until="load", timeout=20000)
+            except Exception:
+                pass                                          # часть картинок не успела — не страшно
+            full = page.screenshot(full_page=True)
+            _, height_px = png_size(full)
+            height = height_px // SHOT_SCALE
+            if height <= SHOT_CHUNK * 1.3:
+                return [full]
+            shots = []
+            for top in range(0, height, SHOT_CHUNK):
+                if len(shots) >= SHOT_MAX:
+                    break
+                clip = {"x": 0, "y": top, "width": SHOT_WIDTH,
+                        "height": min(SHOT_CHUNK, height - top)}
+                shots.append(page.screenshot(full_page=True, clip=clip))
+            return shots
+        finally:
+            browser.close()
+
+
+def send_screenshot(msg, raw_html, reply_to):
+    """Отправляет картинку письма ответом на пост. Ошибки не мешают пересылке."""
+    try:
+        page_html = inline_cid_images(msg, raw_html)
+        if "<meta charset" not in page_html.lower():
+            page_html = '<meta charset="utf-8">' + page_html
+        shots = render_screenshots(page_html)
+    except Exception as err:
+        print(f"Скриншот не получился: {type(err).__name__}")
+        return
+
+    caption = "🖼 Так письмо выглядит в почте"
+    if len(shots) == 1:
+        data = {"chat_id": TG_CHAT_ID, "caption": caption}
+        if reply_to:
+            data["reply_to_message_id"] = reply_to
+        try:
+            tg_call("sendPhoto", data, files={"photo": ("letter.png", shots[0])})
+        except RuntimeError:
+            # слишком вытянутая картинка — отправляем файлом
+            tg_call("sendDocument", data, files={"document": ("letter.png", shots[0])})
+    else:
+        media, files = [], {}
+        for i, shot in enumerate(shots):
+            name = f"shot{i}"
+            item = {"type": "photo", "media": f"attach://{name}"}
+            if i == 0:
+                item["caption"] = f"{caption} ({len(shots)} фрагм.)"
+            media.append(item)
+            files[name] = (f"{name}.png", shot)
+        data = {"chat_id": TG_CHAT_ID, "media": json.dumps(media)}
+        if reply_to:
+            data["reply_to_message_id"] = reply_to
+        tg_call("sendMediaGroup", data, files=files)
+    time.sleep(1)
 
 
 # ---------------------------------------------------------------- IMAP
