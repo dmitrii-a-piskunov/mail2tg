@@ -50,6 +50,10 @@ PART_LIMIT = 3800             # видимых символов в одной ч
 RAW_LIMIT = 20000             # максимум символов разметки в одной части
 MAX_PARTS = 10                # больше частей не отправляем (защита от спама)
 TG_FILE_LIMIT = 50 * 1024 * 1024  # лимит Bot API на отправку файла
+EXCLUDED_SENDERS = {
+    "info@360.yandex.ru",
+    "noreply@id.yandex.ru",
+}
 
 
 # ---------------------------------------------------------------- настройки
@@ -943,8 +947,16 @@ def fallback_entries(msg):
         return [("<i>Текст письма не удалось прочитать — откройте его в почте.</i>", "text", False)]
 
 
+def is_excluded_sender(msg):
+    """Проверяет точный адрес From без учёта регистра и отображаемого имени."""
+    addresses = email.utils.getaddresses([str(value) for value in msg.get_all("From", [])])
+    return any(address.casefold() in EXCLUDED_SENDERS for _, address in addresses)
+
+
 def forward(raw_bytes):
     msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
+    if is_excluded_sender(msg):
+        return False
     raw_msg = email.message_from_bytes(raw_bytes, policy=email.policy.compat32)
     try:
         entries, raw_html, has_table = get_body(msg)
@@ -973,6 +985,7 @@ def forward(raw_bytes):
 
     if raw_html and (SCREENSHOTS == "always" or (SCREENSHOTS == "auto" and has_table)):
         send_screenshot(msg, raw_html, reply_to)
+    return True
 
 
 ALBUM_MAX = 10              # больше файлов в одном альбоме Telegram не разрешает
@@ -1211,8 +1224,8 @@ def main():
             raw = next((item[1] for item in fetched if isinstance(item, tuple)), None)
             if raw:
                 try:
-                    forward(raw)
-                    sent += 1
+                    if forward(raw):
+                        sent += 1
                 except requests.RequestException:
                     raise                   # нет связи с Telegram — попробуем в следующий запуск
                 except Exception as err:
