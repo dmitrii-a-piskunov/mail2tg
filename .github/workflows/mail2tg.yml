@@ -58,6 +58,7 @@ jobs:
           SCREENSHOTS: always
 
       - name: Сохранить состояние
+        id: save_state
         if: always()
         run: |
           git config user.name "mail2tg-bot"
@@ -82,3 +83,12 @@ jobs:
             echo "Не удалось сохранить состояние"
             exit 1
           fi
+
+      - name: Сохранить резервную копию состояния при ошибке push
+        if: ${{ failure() && steps.save_state.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mail2tg-state-${{ github.run_id }}
+          path: state.json
+          retention-days: 7
+          if-no-files-found: error

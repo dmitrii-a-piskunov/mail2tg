@@ -33,6 +33,7 @@ import email.header
 import email.policy
 import email.utils
 import html
+import hashlib
 import imaplib
 import json
 import os
@@ -960,7 +961,9 @@ def is_excluded_sender(msg):
     return any(address.casefold() in EXCLUDED_SENDERS for _, address in addresses)
 
 
-def forward(raw_bytes):
+def forward(raw_bytes, progress=None, checkpoint=None):
+    progress = progress if progress is not None else {}
+    checkpoint = checkpoint or (lambda: None)
     msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
     if is_excluded_sender(msg):
         return False
@@ -971,8 +974,18 @@ def forward(raw_bytes):
         # необычный HTML не должен ломать пересылку — отправляем упрощённый текст
         print(f"Не удалось разобрать письмо ({type(err).__name__}), отправляю упрощённо.")
         entries, raw_html, has_table = fallback_entries(msg), None, False
-    reply_to = None
-    for text in build_messages(msg, raw_msg, entries):
+    messages = list(build_messages(msg, raw_msg, entries))
+    fingerprint = hashlib.sha256(raw_bytes + TG_CHAT_ID.encode()
+                                 + json.dumps(messages, ensure_ascii=False).encode()).hexdigest()
+    if progress.get("fingerprint", fingerprint) != fingerprint:
+        raise RuntimeError("DeliveryPlanChanged")
+    progress["fingerprint"] = fingerprint
+    if progress.get("complete"):
+        return True
+    reply_to = progress.get("reply_to")
+    for index, text in enumerate(messages):
+        if index < progress.get("text_parts", 0):
+            continue
         try:
             sent = send_text(text, reply_to=reply_to)
         except RuntimeError as err:
@@ -985,26 +998,41 @@ def forward(raw_bytes):
             sent = tg_call("sendMessage", data)
         if reply_to is None:
             reply_to = sent["message_id"]   # продолжение и файлы — ответом на первую часть
+        progress["reply_to"] = reply_to
+        progress["text_parts"] = index + 1
+        checkpoint()
         time.sleep(1)
 
     # порядок: письмо → вложения → скриншот
-    send_attachments(get_attachments(msg), reply_to)
+    send_attachments(get_attachments(msg), reply_to, progress, checkpoint)
 
-    if raw_html and (SCREENSHOTS == "always" or (SCREENSHOTS == "auto" and has_table)):
-        send_screenshot(msg, raw_html, reply_to)
+    if (not progress.get("screenshot") and raw_html
+            and (SCREENSHOTS == "always" or (SCREENSHOTS == "auto" and has_table))):
+        status = send_screenshot(msg, raw_html, reply_to)
+        progress["screenshot"] = status
+        checkpoint()
+    progress["complete"] = True
+    checkpoint()
     return True
 
 
 ALBUM_MAX = 10              # больше файлов в одном альбоме Telegram не разрешает
 
 
-def send_attachments(attachments, reply_to):
+def send_attachments(attachments, reply_to, progress=None, checkpoint=None):
     """Вложения ответом на пост: альбомами по 10 файлов."""
+    progress = progress if progress is not None else {}
+    checkpoint = checkpoint or (lambda: None)
+    done = progress.setdefault("attachments", [])
     too_big = [name for name, content in attachments if len(content) > TG_FILE_LIMIT]
     files = [(name, content) for name, content in attachments if len(content) <= TG_FILE_LIMIT]
 
     for start in range(0, len(files), ALBUM_MAX):
-        chunk = files[start:start + ALBUM_MAX]
+        pending = [(index, files[index]) for index in range(start, min(start + ALBUM_MAX, len(files)))
+                   if index not in done]
+        if not pending:
+            continue
+        chunk = [item for _, item in pending]
         if len(chunk) == 1:
             send_file(chunk[0][0], chunk[0][1], reply_to=reply_to)
         else:
@@ -1017,14 +1045,22 @@ def send_attachments(attachments, reply_to):
                 tg_call("sendMediaGroup", data, files=upload)
             except RuntimeError:
                 # альбом не принят (например, необычный файл) — отправляем по одному
-                for name, content in chunk:
+                for index, (name, content) in pending:
                     send_file(name, content, reply_to=reply_to)
+                    done.append(index)
+                    checkpoint()
                     time.sleep(1)
+        for index, _ in pending:
+            if index not in done:
+                done.append(index)
+        checkpoint()
         time.sleep(1)
 
-    if too_big:
+    if too_big and not progress.get("oversize_notice"):
         names = ", ".join(f"«{html.escape(n)}»" for n in too_big)
         send_text(f"📎 Больше 50 МБ, откройте в почте: {names}", reply_to=reply_to)
+        progress["oversize_notice"] = True
+        checkpoint()
 
 
 # ---------------------------------------------------------------- скриншот письма
@@ -1115,7 +1151,7 @@ def send_screenshot(msg, raw_html, reply_to):
         shots = render_screenshots(page_html)
     except Exception as err:
         print(f"Скриншот не получился: {type(err).__name__}")
-        return
+        return "render_failed"
 
     caption = "🖼 Так письмо выглядит в почте"
     if len(shots) == 1:
@@ -1141,6 +1177,7 @@ def send_screenshot(msg, raw_html, reply_to):
             data["reply_to_message_id"] = reply_to
         tg_call("sendMediaGroup", data, files=files)
     time.sleep(1)
+    return "sent"
 
 
 # ---------------------------------------------------------------- IMAP
@@ -1175,7 +1212,7 @@ def parse_date(value):
     return f"{day:02d}-{IMAP_MONTHS[month - 1]}-{year}"
 
 
-def deliver_uid(imap, uid):
+def deliver_uid(imap, uid, progress, checkpoint):
     """Неуспешная загрузка никогда не считается доставленным письмом."""
     typ, fetched = imap.uid("fetch", str(uid), "(BODY.PEEK[])")
     if typ != "OK" or not fetched:
@@ -1184,7 +1221,7 @@ def deliver_uid(imap, uid):
                 if isinstance(item, tuple) and isinstance(item[1], bytes) and item[1]), None)
     if raw is None:
         raise RuntimeError("IMAPEmptyMessage")
-    return forward(raw)
+    return forward(raw, progress, checkpoint)
 
 
 def main():
@@ -1222,6 +1259,7 @@ def main():
 
         scope = f"history:{backfill['since']}" if backfill is not None else "live"
         failures = state.setdefault("failed", {}).setdefault(scope, {})
+        deliveries = state.setdefault("deliveries", {}).setdefault(scope, {})
         if RETRY_FAILED_UIDS:
             if not re.fullmatch(r"\d+(?:\s*,\s*\d+)*", RETRY_FAILED_UIDS):
                 raise ValueError("RETRY_FAILED_UIDS: ожидаются UID через запятую")
@@ -1259,9 +1297,11 @@ def main():
         for uid in retry_batch + batch:
             key = str(uid)
             try:
-                if deliver_uid(imap, uid):
+                progress = deliveries.setdefault(key, {})
+                if deliver_uid(imap, uid, progress, lambda: save_state(state)):
                     sent += 1
                 failures.pop(key, None)  # исключённый отправитель также обработан
+                deliveries.pop(key, None)
             except Exception as err:
                 attempts = failures.get(key, {}).get("attempts", 0) + 1
                 failures[key] = {"attempts": attempts, "error": type(err).__name__}
