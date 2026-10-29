@@ -1,4 +1,10 @@
 {
   "uidvalidity": 1788780658,
-  "last_uid": 19
+  "last_uid": 21,
+  "failed": {
+    "live": {}
+  },
+  "deliveries": {
+    "live": {}
+  }
 }
