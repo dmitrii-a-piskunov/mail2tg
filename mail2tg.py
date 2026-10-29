@@ -1145,6 +1145,7 @@ SHOT_MAX_WIDTH = 1200       # шире не делаем, иначе на тел
 SHOT_SCALE = 2              # чёткость картинки
 SHOT_CHUNK = 1800           # высота одного кадра, px (длинное письмо режется на кадры)
 SHOT_MAX = 10               # не больше 10 картинок (лимит альбома Telegram)
+SHOT_HTML_LIMIT = 5 * 1024 * 1024  # HTML вместе со встроенными изображениями
 
 
 def inline_cid_images(msg, raw_html):
@@ -1167,6 +1168,8 @@ def png_size(png):
 
 def render_screenshots(page_html):
     """Открывает письмо в браузере и возвращает список PNG-кадров."""
+    if len(page_html.encode("utf-8")) > SHOT_HTML_LIMIT:
+        raise ValueError("ScreenshotHTMLTooLarge")
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
@@ -1179,8 +1182,14 @@ def render_screenshots(page_html):
                 viewport={"width": SHOT_WIDTH, "height": 100},   # высота подстроится под письмо
                 device_scale_factor=SHOT_SCALE,
                 java_script_enabled=False,                    # скрипты из писем не выполняем
+                service_workers="block",
             )
+            # Внешние изображения, CSS, iframe и трекеры не загружаем.
+            # data: используется для встроенных CID-изображений.
+            context.route("**/*", lambda route: route.continue_()
+                          if route.request.url.startswith(("data:", "about:")) else route.abort())
             page = context.new_page()
+            page.set_default_timeout(10000)
             try:
                 page.set_content(page_html, wait_until="load", timeout=20000)
             except Exception:
@@ -1199,19 +1208,26 @@ def render_screenshots(page_html):
                 page.set_viewport_size({"width": width, "height": 100})
                 page.wait_for_timeout(300)
 
-            full = page.screenshot(full_page=True)
-            width_px, height_px = png_size(full)
-            width = width_px // SHOT_SCALE
-            height = height_px // SHOT_SCALE
-            if height <= SHOT_CHUNK * 1.3:
-                return [full]
+            # Измеряем страницу до захвата: огромный full_page PNG не создаётся.
+            max_height = SHOT_CHUNK * SHOT_MAX
+            content_height = page.evaluate(
+                "Math.max(document.documentElement.scrollHeight,"
+                " document.body ? document.body.scrollHeight : 0)")
+            height = min(max(int(content_height or 0), 1), max_height)
+            if int(content_height or 0) > max_height:
+                print("Скриншот ограничен по высоте; продолжение доступно в почте.")
+            page.set_viewport_size({"width": width, "height": height})
+            # После изменения viewport высота адаптивной вёрстки может измениться.
+            content_height = page.evaluate(
+                "Math.max(document.documentElement.scrollHeight,"
+                " document.body ? document.body.scrollHeight : 0)")
+            height = min(max(int(content_height or 0), 1), height)
             shots = []
             for top in range(0, height, SHOT_CHUNK):
-                if len(shots) >= SHOT_MAX:
-                    break
                 clip = {"x": 0, "y": top, "width": width,
                         "height": min(SHOT_CHUNK, height - top)}
-                shots.append(page.screenshot(full_page=True, clip=clip))
+                shots.append(page.screenshot(full_page=False, clip=clip, animations="disabled",
+                                             timeout=10000))
             return shots
         finally:
             browser.close()

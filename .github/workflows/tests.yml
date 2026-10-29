@@ -35,3 +35,7 @@ jobs:
           python -c "import requests; from playwright.sync_api import sync_playwright"
       - name: Запустить тесты без почты и Telegram
         run: python -B -m unittest discover -s tests -v
+      - name: Проверить ограничения скриншотов в браузере
+        run: python -B -m unittest discover -s tests -p test_screenshots.py -v
+        env:
+          MAIL2TG_BROWSER_TESTS: "1"
