@@ -53,6 +53,8 @@ TG_FILE_LIMIT = 50 * 1024 * 1024  # лимит Bot API на отправку ф�
 EXCLUDED_SENDERS = {
     "info@360.yandex.ru",
     "noreply@id.yandex.ru",
+    "hello@360.yandex.ru",
+    "mailer-daemon@yandex.ru",
 }
 
 
