@@ -40,6 +40,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Сохранить состояние до запуска для сравнения ошибок
+        run: cp state.json "$RUNNER_TEMP/mail2tg-state-before.json"
+
       - name: Установить зависимости
         # playwright нужен для скриншотов писем; сам браузер (Chrome) в GitHub уже установлен
         run: pip install --quiet requests playwright
@@ -92,3 +95,15 @@ jobs:
           path: state.json
           retention-days: 7
           if-no-files-found: error
+
+      - name: Уведомить владельца и подтвердить успешную проверку почты
+        if: always()
+        run: python3 monitoring.py
+        env:
+          WORKFLOW_STATUS: ${{ job.status }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_ADMIN_CHAT_ID: ${{ secrets.TG_ADMIN_CHAT_ID }}
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+          BACKFILL_SINCE: ${{ inputs.since }}
+          RETRY_FAILED_UIDS: ${{ inputs.retry_uids }}
+          STATE_BEFORE_PATH: ${{ runner.temp }}/mail2tg-state-before.json
