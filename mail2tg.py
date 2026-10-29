@@ -18,6 +18,7 @@
   IMAP_FOLDER    — по умолчанию INBOX
   TZ_NAME        — часовой пояс для даты письма, по умолчанию Europe/Samara
   MAX_PER_RUN    — сколько писем максимум за один запуск, по умолчанию 20
+  RETRY_FAILED_UIDS — UID через запятую: сбросить лимит попыток выбранных ошибок
   SCREENSHOTS    — картинка письма: always (для всех писем, по умолчанию),
                    auto (только письма с таблицами) или off (никогда)
   BACKFILL_SINCE — дата (2026-09-01 или 01.09.2026): повторить обработанную
@@ -75,6 +76,10 @@ TG_TOKEN = env("TG_TOKEN")
 TG_CHAT_ID = env("TG_CHAT_ID")
 TZ = ZoneInfo(env("TZ_NAME", "Europe/Samara"))
 MAX_PER_RUN = int(env("MAX_PER_RUN", required=False) or "20")
+if MAX_PER_RUN < 1:
+    sys.exit("MAX_PER_RUN должен быть положительным")
+MAX_DELIVERY_ATTEMPTS = 5
+RETRY_FAILED_UIDS = (os.environ.get("RETRY_FAILED_UIDS") or "").strip()
 BACKFILL_SINCE = (os.environ.get("BACKFILL_SINCE") or "").strip()
 # Скриншот письма: always — для всех писем, auto — только с таблицами, off — никогда
 SCREENSHOTS = (os.environ.get("SCREENSHOTS") or "always").strip().lower()
@@ -1170,6 +1175,18 @@ def parse_date(value):
     return f"{day:02d}-{IMAP_MONTHS[month - 1]}-{year}"
 
 
+def deliver_uid(imap, uid):
+    """Неуспешная загрузка никогда не считается доставленным письмом."""
+    typ, fetched = imap.uid("fetch", str(uid), "(BODY.PEEK[])")
+    if typ != "OK" or not fetched:
+        raise RuntimeError("IMAPFetchFailed")
+    raw = next((item[1] for item in fetched
+                if isinstance(item, tuple) and isinstance(item[1], bytes) and item[1]), None)
+    if raw is None:
+        raise RuntimeError("IMAPEmptyMessage")
+    return forward(raw)
+
+
 def main():
     state = load_state()
 
@@ -1183,7 +1200,7 @@ def main():
         if state.get("uidvalidity") != uidvalidity:
             state = {"uidvalidity": uidvalidity, "last_uid": uidnext - 1}
             save_state(state)
-            print("Первый запуск: позиция сохранена, старые письма не пересылаются.")
+            print("Позиция IMAP инициализирована.")
             if not BACKFILL_SINCE:
                 send_text("✅ Бот подключён. Новые письма будут появляться здесь.")
                 return
@@ -1203,51 +1220,58 @@ def main():
             last_uid = int(state.get("last_uid", 0))
             end_uid = uidnext - 1
 
-        if end_uid <= last_uid:
-            print("История переслана." if backfill is not None else "Новых писем нет.")
-            return
+        scope = f"history:{backfill['since']}" if backfill is not None else "live"
+        failures = state.setdefault("failed", {}).setdefault(scope, {})
+        if RETRY_FAILED_UIDS:
+            if not re.fullmatch(r"\d+(?:\s*,\s*\d+)*", RETRY_FAILED_UIDS):
+                raise ValueError("RETRY_FAILED_UIDS: ожидаются UID через запятую")
+            for value in RETRY_FAILED_UIDS.split(","):
+                key = str(int(value.strip()))
+                if key in failures:
+                    failures[key]["attempts"] = 0
+            save_state(state)
 
-        imap.select(IMAP_FOLDER, readonly=True)
-        criteria = [f"UID {last_uid + 1}:{end_uid}"]
-        if backfill is not None:
-            criteria.extend(["SINCE", backfill["since"]])
-        typ, data = imap.uid("search", None, *criteria)
+        typ, _ = imap.select(IMAP_FOLDER, readonly=True)
         if typ != "OK":
-            raise RuntimeError("Не удалось найти письма в IMAP")
-        uids = sorted(int(u) for u in data[0].split() if last_uid < int(u) <= end_uid)
-        if not uids:
+            raise RuntimeError("Не удалось открыть папку IMAP")
+        uids = []
+        if end_uid > last_uid:
+            criteria = [f"UID {last_uid + 1}:{end_uid}"]
             if backfill is not None:
-                backfill["last_uid"] = end_uid
-                save_state(state)
-            print("С указанной даты писем в истории нет." if backfill is not None else "Новых писем нет.")
-            return
+                criteria.extend(["SINCE", backfill["since"]])
+            typ, data = imap.uid("search", None, *criteria)
+            if typ != "OK" or not data or not isinstance(data[0], bytes):
+                raise RuntimeError("Не удалось найти письма в IMAP")
+            uids = sorted(int(u) for u in data[0].split() if last_uid < int(u) <= end_uid)
 
         if backfill is not None:
             print("Пересылаю историю; позиция новых писем не изменяется.")
 
-        batch = uids[:MAX_PER_RUN]
+        retries = sorted(int(uid) for uid, failure in failures.items()
+                         if failure["attempts"] < MAX_DELIVERY_ATTEMPTS)
+        # Часть лимита оставляем новым письмам, чтобы очередь ошибок не блокировала их.
+        retry_limit = max(1, MAX_PER_RUN // 2) if uids and MAX_PER_RUN > 1 else MAX_PER_RUN
+        if uids and MAX_PER_RUN == 1:
+            retry_limit = 0
+        retry_batch = retries[:retry_limit]
+        batch = uids[:MAX_PER_RUN - len(retry_batch)]
         sent = 0
-        for uid in batch:
-            typ, fetched = imap.uid("fetch", str(uid), "(BODY.PEEK[])")
-            raw = next((item[1] for item in fetched if isinstance(item, tuple)), None)
-            if raw:
-                try:
-                    if forward(raw):
-                        sent += 1
-                except requests.RequestException:
-                    raise                   # нет связи с Telegram — попробуем в следующий запуск
-                except Exception as err:
-                    # одно «сломанное» письмо не должно останавливать бота навсегда
-                    print(f"Письмо не переслано: {type(err).__name__}: {str(err)[:200]}")
-                    try:
-                        send_text("⚠️ Одно письмо не удалось переслать — откройте почту.")
-                    except Exception:
-                        pass
-            # сохраняем после каждого письма, чтобы при сбое не было дублей
-            if backfill is not None:
-                backfill["last_uid"] = uid
-            else:
-                state["last_uid"] = uid
+        for uid in retry_batch + batch:
+            key = str(uid)
+            try:
+                if deliver_uid(imap, uid):
+                    sent += 1
+                failures.pop(key, None)  # исключённый отправитель также обработан
+            except Exception as err:
+                attempts = failures.get(key, {}).get("attempts", 0) + 1
+                failures[key] = {"attempts": attempts, "error": type(err).__name__}
+                print(f"Ошибка доставки UID {uid}: {type(err).__name__}; попытка {attempts}.")
+            # Курсор — граница просмотренных UID; неудачи сохраняются отдельно.
+            if uid in batch:
+                if backfill is not None:
+                    backfill["last_uid"] = uid
+                else:
+                    state["last_uid"] = uid
             save_state(state)
             time.sleep(1)
 
@@ -1256,6 +1280,9 @@ def main():
             backfill["last_uid"] = end_uid
             save_state(state)
         print(f"Переслано писем: {sent}." + (f" Осталось на следующий запуск: {rest}." if rest else ""))
+        pending = sum(f["attempts"] < MAX_DELIVERY_ATTEMPTS for f in failures.values())
+        exhausted = len(failures) - pending
+        print(f"Ожидают повтора: {pending}. Требуют ручного повтора: {exhausted}.")
     finally:
         try:
             imap.logout()
