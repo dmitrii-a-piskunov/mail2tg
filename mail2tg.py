@@ -20,8 +20,8 @@
   MAX_PER_RUN    — сколько писем максимум за один запуск, по умолчанию 20
   SCREENSHOTS    — картинка письма: always (для всех писем, по умолчанию),
                    auto (только письма с таблицами) или off (никогда)
-  BACKFILL_SINCE — дата (2026-09-01 или 01.09.2026): переслать все письма,
-                   пришедшие начиная с этого дня. Задаётся при ручном запуске.
+  BACKFILL_SINCE — дата (2026-09-01 или 01.09.2026): повторить обработанную
+                   историю с этого дня, не меняя позицию новых писем.
 
 ВАЖНО: в публичном репозитории логи Actions видны всем, поэтому скрипт
 не печатает в лог ни темы, ни адреса, ни текст писем — только счётчики.
@@ -1170,13 +1170,6 @@ def parse_date(value):
     return f"{day:02d}-{IMAP_MONTHS[month - 1]}-{year}"
 
 
-def find_start_uid(imap, since):
-    imap.select(IMAP_FOLDER, readonly=True)
-    typ, data = imap.uid("search", None, "SINCE", parse_date(since))
-    uids = [int(u) for u in data[0].split()] if typ == "OK" else []
-    return min(uids) if uids else None
-
-
 def main():
     state = load_state()
 
@@ -1185,39 +1178,52 @@ def main():
         imap.login(IMAP_USER, IMAP_PASSWORD)
         uidvalidity, uidnext = folder_status(imap)
 
-        # Ручной запуск с датой: перематываем позицию назад, к первому
-        # письму, пришедшему в этот день или позже.
-        if BACKFILL_SINCE:
-            start_uid = find_start_uid(imap, BACKFILL_SINCE)
-            if start_uid is None:
-                print("С указанной даты писем нет.")
-                state = {"uidvalidity": uidvalidity, "last_uid": uidnext - 1}
-                save_state(state)
-                return
-            state = {"uidvalidity": uidvalidity, "last_uid": start_uid - 1}
-            save_state(state)
-            print("Позиция перемотана к указанной дате.")
-            send_text(f"📬 Публикую письма, пришедшие начиная с {html.escape(BACKFILL_SINCE)}.")
-
         # Первый запуск (или Яндекс пересоздал нумерацию писем):
         # запоминаем текущую позицию и старые письма не пересылаем.
         if state.get("uidvalidity") != uidvalidity:
-            save_state({"uidvalidity": uidvalidity, "last_uid": uidnext - 1})
+            state = {"uidvalidity": uidvalidity, "last_uid": uidnext - 1}
+            save_state(state)
             print("Первый запуск: позиция сохранена, старые письма не пересылаются.")
-            send_text("✅ Бот подключён. Новые письма будут появляться здесь.")
-            return
+            if not BACKFILL_SINCE:
+                send_text("✅ Бот подключён. Новые письма будут появляться здесь.")
+                return
 
-        last_uid = int(state.get("last_uid", 0))
-        if uidnext - 1 <= last_uid:
-            print("Новых писем нет.")
+        backfill = None
+        if BACKFILL_SINCE:
+            since = parse_date(BACKFILL_SINCE)
+            backfill = state.get("backfill")
+            if not backfill or backfill.get("since") != since:
+                backfill = {"since": since, "last_uid": 0,
+                            "end_uid": int(state.get("last_uid", 0))}
+                state["backfill"] = backfill
+                save_state(state)
+            last_uid = int(backfill["last_uid"])
+            end_uid = int(backfill["end_uid"])
+        else:
+            last_uid = int(state.get("last_uid", 0))
+            end_uid = uidnext - 1
+
+        if end_uid <= last_uid:
+            print("История переслана." if backfill is not None else "Новых писем нет.")
             return
 
         imap.select(IMAP_FOLDER, readonly=True)
-        typ, data = imap.uid("search", None, f"UID {last_uid + 1}:*")
-        uids = sorted(int(u) for u in data[0].split() if int(u) > last_uid)
+        criteria = [f"UID {last_uid + 1}:{end_uid}"]
+        if backfill is not None:
+            criteria.extend(["SINCE", backfill["since"]])
+        typ, data = imap.uid("search", None, *criteria)
+        if typ != "OK":
+            raise RuntimeError("Не удалось найти письма в IMAP")
+        uids = sorted(int(u) for u in data[0].split() if last_uid < int(u) <= end_uid)
         if not uids:
-            print("Новых писем нет.")
+            if backfill is not None:
+                backfill["last_uid"] = end_uid
+                save_state(state)
+            print("С указанной даты писем в истории нет." if backfill is not None else "Новых писем нет.")
             return
+
+        if backfill is not None:
+            print("Пересылаю историю; позиция новых писем не изменяется.")
 
         batch = uids[:MAX_PER_RUN]
         sent = 0
@@ -1238,11 +1244,17 @@ def main():
                     except Exception:
                         pass
             # сохраняем после каждого письма, чтобы при сбое не было дублей
-            state["last_uid"] = uid
+            if backfill is not None:
+                backfill["last_uid"] = uid
+            else:
+                state["last_uid"] = uid
             save_state(state)
             time.sleep(1)
 
         rest = len(uids) - len(batch)
+        if backfill is not None and not rest:
+            backfill["last_uid"] = end_uid
+            save_state(state)
         print(f"Переслано писем: {sent}." + (f" Осталось на следующий запуск: {rest}." if rest else ""))
     finally:
         try:
