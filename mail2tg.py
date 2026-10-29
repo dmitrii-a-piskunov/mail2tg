@@ -83,6 +83,7 @@ if MAX_PER_RUN < 1:
 MAX_DELIVERY_ATTEMPTS = 5
 RETRY_FAILED_UIDS = (os.environ.get("RETRY_FAILED_UIDS") or "").strip()
 BACKFILL_SINCE = (os.environ.get("BACKFILL_SINCE") or "").strip()
+BACKFILL_RESTART = (os.environ.get("BACKFILL_RESTART") or "").strip().lower() == "true"
 # Скриншот письма: always — для всех писем, auto — только с таблицами, off — никогда
 SCREENSHOTS = (os.environ.get("SCREENSHOTS") or "always").strip().lower()
 
@@ -1316,6 +1317,9 @@ def deliver_uid(imap, uid, progress, checkpoint):
 
 
 def main():
+    if BACKFILL_RESTART and (not BACKFILL_SINCE
+                             or os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch"):
+        raise ValueError("Начать историю заново можно только при ручном запуске с датой since")
     state = load_state()
 
     imap = imaplib.IMAP4_SSL(IMAP_HOST, 993)
@@ -1336,8 +1340,13 @@ def main():
         backfill = None
         if BACKFILL_SINCE:
             since = parse_date(BACKFILL_SINCE)
+            if BACKFILL_RESTART:
+                # Намеренная новая копия истории: прежние подтверждения не используем.
+                history_scope = f"history:{since}"
+                state.get("failed", {}).pop(history_scope, None)
+                state.get("deliveries", {}).pop(history_scope, None)
             backfill = state.get("backfill")
-            if not backfill or backfill.get("since") != since:
+            if BACKFILL_RESTART or not backfill or backfill.get("since") != since:
                 backfill = {"since": since, "last_uid": 0,
                             "end_uid": int(state.get("last_uid", 0))}
                 state["backfill"] = backfill

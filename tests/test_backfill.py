@@ -4,6 +4,7 @@ import ast
 import copy
 import re
 import sys
+import os
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,12 +25,13 @@ class BackfillTests(unittest.TestCase):
         self.searches = []
         self.saved = []
         self.ns = {
-            "re": re, "sys": sys,
+            "re": re, "sys": sys, "os": os,
             "IMAP_MONTHS": ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                             "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
             "IMAP_HOST": "example.test", "IMAP_USER": "test", "IMAP_PASSWORD": "test",
             "IMAP_FOLDER": "INBOX", "MAX_PER_RUN": 2, "BACKFILL_SINCE": "2026-09-01",
             "MAX_DELIVERY_ATTEMPTS": 5, "RETRY_FAILED_UIDS": "",
+            "BACKFILL_RESTART": False,
             "StateError": type("StateError", (RuntimeError,), {}),
             "load_state": lambda: copy.deepcopy(self.state),
             "save_state": self.save,
@@ -75,6 +77,30 @@ class BackfillTests(unittest.TestCase):
         self.assertEqual(len(self.run_delivery("2026-09-01")), 9)
         self.assertEqual(self.run_delivery("2026-09-01"), [])
         self.assertEqual(self.state["last_uid"], 18)
+
+    def test_restart_history_preserves_live_state(self):
+        from unittest.mock import patch
+        self.ns["MAX_PER_RUN"] = 20
+        self.run_delivery("2026-09-01")
+        self.state["failed"]["live"] = {"18": {"attempts": 1, "error": "ConnectionError"}}
+        self.state["deliveries"]["live"] = {"18": {"text_parts": 1, "reply_to": 42}}
+        self.state["deliveries"]["history:01-Sep-2026"] = {"10": {"complete": True}}
+        self.ns["BACKFILL_RESTART"] = True
+        with patch.dict(os.environ, {"GITHUB_EVENT_NAME": "workflow_dispatch"}):
+            self.assertEqual(len(self.run_delivery("01.09.2026")), 9)
+        self.assertEqual(self.state["last_uid"], 18)
+        self.assertIn("18", self.state["failed"]["live"])
+        self.assertIn("18", self.state["deliveries"]["live"])
+        self.assertEqual(self.state["deliveries"]["history:01-Sep-2026"], {})
+
+    def test_restart_without_date_or_from_schedule_is_rejected(self):
+        from unittest.mock import patch
+        self.ns["BACKFILL_RESTART"] = True
+        for event, since in [("workflow_dispatch", ""), ("schedule", "2026-09-01")]:
+            with self.subTest(event=event), patch.dict(os.environ, {"GITHUB_EVENT_NAME": event}):
+                with self.assertRaises(ValueError):
+                    self.run_delivery(since)
+        self.ns["imaplib"].IMAP4_SSL.assert_not_called()
 
     def test_different_date_starts_new_history(self):
         self.run_delivery("2026-09-01")

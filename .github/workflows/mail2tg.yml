@@ -22,6 +22,11 @@ on:
         description: "Сколько писем отправить за этот запуск"
         required: false
         default: "20"
+      restart_history:
+        description: "Начать историю заново (только с датой since; намеренно повторить письма)"
+        type: boolean
+        required: false
+        default: false
       retry_uids:
         description: "Сбросить лимит попыток для неудачных UID через запятую. Для истории также укажите since"
         required: false
@@ -88,6 +93,7 @@ jobs:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           BACKFILL_SINCE: ${{ inputs.since }}
+          BACKFILL_RESTART: ${{ inputs.restart_history }}
           MAX_PER_RUN: ${{ inputs.max_per_run }}
           RETRY_FAILED_UIDS: ${{ inputs.retry_uids }}
           # картинка письма: always — для всех писем, auto — только с таблицами, off — выключить

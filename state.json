@@ -8,10 +8,5 @@
   "deliveries": {
     "live": {},
     "history:01-Sep-2026": {}
-  },
-  "backfill": {
-    "since": "01-Sep-2026",
-    "last_uid": 21,
-    "end_uid": 21
   }
 }
