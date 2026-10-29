@@ -30,6 +30,7 @@ class BackfillTests(unittest.TestCase):
             "IMAP_HOST": "example.test", "IMAP_USER": "test", "IMAP_PASSWORD": "test",
             "IMAP_FOLDER": "INBOX", "MAX_PER_RUN": 2, "BACKFILL_SINCE": "2026-09-01",
             "MAX_DELIVERY_ATTEMPTS": 5, "RETRY_FAILED_UIDS": "",
+            "StateError": type("StateError", (RuntimeError,), {}),
             "load_state": lambda: copy.deepcopy(self.state),
             "save_state": self.save,
             "imaplib": SimpleNamespace(IMAP4_SSL=Mock(return_value=self.imap)),
@@ -159,6 +160,16 @@ class BackfillTests(unittest.TestCase):
             self.run_delivery("")
         self.assertEqual(self.state["last_uid"], 18)
         self.assertFalse(self.ns["forward"].called)
+
+    def test_checkpoint_error_stops_delivery_immediately(self):
+        self.ns["folder_status"].return_value = (1, 22)
+        def broken_checkpoint(raw, progress, checkpoint):
+            raise self.ns["StateError"]("save failed")
+        self.ns["forward"].side_effect = broken_checkpoint
+        with self.assertRaises(self.ns["StateError"]):
+            self.run_delivery("")
+        self.assertEqual(self.state["last_uid"], 18)
+        self.assertEqual(self.ns["forward"].call_count, 1)
 
     def test_search_error_preserves_cursor(self):
         self.imap.uid.side_effect = None

@@ -39,6 +39,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 from html.parser import HTMLParser
 from pathlib import Path
@@ -90,15 +91,89 @@ TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 
 # ---------------------------------------------------------------- состояние
 
+class StateError(RuntimeError):
+    """Ошибка состояния требует остановки доставки."""
+
+
+def validate_state(state):
+    def require(condition):
+        if not condition:
+            raise StateError("Некорректная структура state.json; восстановите состояние из резервной копии.")
+
+    def integer(value, minimum=0):
+        return type(value) is int and value >= minimum
+
+    require(isinstance(state, dict))
+    if not state:  # Явная инициализация нового ящика.
+        return
+    require(integer(state.get("uidvalidity"), 1) and integer(state.get("last_uid")))
+    if "backfill" in state:
+        backfill = state["backfill"]
+        require(isinstance(backfill, dict))
+        require(isinstance(backfill.get("since"), str)
+                and bool(re.fullmatch(r"\d{2}-[A-Z][a-z]{2}-\d{4}", backfill["since"])))
+        require(integer(backfill.get("last_uid")) and integer(backfill.get("end_uid")))
+        require(backfill["last_uid"] <= backfill["end_uid"] <= state["last_uid"])
+    for section in ("failed", "deliveries"):
+        scopes = state.get(section, {})
+        require(isinstance(scopes, dict))
+        for scope, entries in scopes.items():
+            require(isinstance(scope, str) and (scope == "live" or bool(
+                re.fullmatch(r"history:\d{2}-[A-Z][a-z]{2}-\d{4}", scope))))
+            require(isinstance(entries, dict))
+            for uid, entry in entries.items():
+                require(isinstance(uid, str) and bool(re.fullmatch(r"[1-9]\d*", uid)))
+                require(isinstance(entry, dict))
+                if section == "failed":
+                    require(integer(entry.get("attempts")) and isinstance(entry.get("error"), str))
+                    continue
+                if "fingerprint" in entry:
+                    require(isinstance(entry["fingerprint"], str) and bool(
+                        re.fullmatch(r"[0-9a-f]{64}", entry["fingerprint"])))
+                for key in ("text_parts", "reply_to"):
+                    if key in entry:
+                        require(integer(entry[key], 1 if key == "reply_to" else 0))
+                require(not entry.get("text_parts", 0) or "reply_to" in entry)
+                if "attachments" in entry:
+                    require(isinstance(entry["attachments"], list))
+                    require(all(integer(index) for index in entry["attachments"]))
+                    require(len(set(entry["attachments"])) == len(entry["attachments"]))
+                if "screenshot" in entry:
+                    require(entry["screenshot"] in ("sent", "render_failed"))
+                if "complete" in entry:
+                    require(type(entry["complete"]) is bool)
+                if "oversize_notice" in entry:
+                    require(type(entry["oversize_notice"]) is bool)
+
+
 def load_state():
     try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        raise StateError("Не удалось прочитать state.json; восстановите файл перед запуском.") from None
+    validate_state(state)
+    return state
 
 
 def save_state(state):
-    STATE_FILE.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    validate_state(state)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=STATE_FILE.parent,
+                                         prefix=".mail2tg-state-", suffix=".tmp", delete=False) as output:
+            temporary = Path(output.name)
+            output.write(json.dumps(state, indent=2) + "\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, STATE_FILE)
+    except (OSError, ValueError, TypeError):
+        raise StateError("Не удалось сохранить state.json; доставка остановлена.") from None
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------- Telegram
@@ -1302,6 +1377,8 @@ def main():
                     sent += 1
                 failures.pop(key, None)  # исключённый отправитель также обработан
                 deliveries.pop(key, None)
+            except StateError:
+                raise
             except Exception as err:
                 attempts = failures.get(key, {}).get("attempts", 0) + 1
                 failures[key] = {"attempts": attempts, "error": type(err).__name__}
