@@ -9,6 +9,11 @@ on:
     - cron: "17 3 1 * *"
   workflow_dispatch:      # кнопка ручного запуска во вкладке Actions
     inputs:
+      test_notification:
+        description: "Только тест уведомления владельцу (без обработки почты)"
+        type: boolean
+        required: false
+        default: false
       since:
         description: "Повторить обработанную историю с даты (2026-09-01 или 01.09.2026). Та же дата — продолжить. Пусто — новые"
         required: false
@@ -30,7 +35,26 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  test_notification:
+    if: ${{ inputs.test_notification == true }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Отправить тестовое уведомление владельцу
+        run: python3 monitoring.py --test
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_ADMIN_CHAT_ID: ${{ secrets.TG_ADMIN_CHAT_ID }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+
   forward:
+    if: ${{ inputs.test_notification != true }}
     runs-on: ubuntu-24.04     # фиксируем версию, чтобы обновления GitHub ничего не сломали
     timeout-minutes: 30
     steps:

@@ -1,5 +1,6 @@
 """Уведомления владельцу и сигнал внешнему мониторингу после завершения workflow."""
 
+import argparse
 import json
 import os
 from datetime import datetime
@@ -123,5 +124,23 @@ def report():
     return True
 
 
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--test", action="store_true", help="Только тест личного уведомления")
+    args = parser.parse_args(argv)
+    if args.test:
+        token = os.environ.get("TG_TOKEN", "").strip()
+        admin = os.environ.get("TG_ADMIN_CHAT_ID", "").strip()
+        if not token or not admin:
+            print("Тест не выполнен: задайте TG_TOKEN и TG_ADMIN_CHAT_ID в GitHub Secrets.")
+            return 1
+        if admin == os.environ.get("TG_CHAT_ID", "").strip():
+            print("Тест не выполнен: чат владельца совпадает с учебным каналом.")
+            return 1
+        return 0 if notify_admin("✅ mail2tg: тест личных уведомлений. "
+                                 "Связь с ботом работает.") else 1
+    return 0 if report() else 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(0 if report() else 1)
+    raise SystemExit(main())

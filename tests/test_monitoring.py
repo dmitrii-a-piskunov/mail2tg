@@ -38,6 +38,29 @@ class MonitoringTests(unittest.TestCase):
         self.ping.assert_called_once()
         self.notify.assert_not_called()
 
+    def test_manual_notification_does_not_read_state_or_ping(self):
+        with patch.object(monitoring, "read_state") as reader:
+            self.assertEqual(monitoring.main(["--test"]), 0)
+            reader.assert_not_called()
+        self.notify.assert_called_once()
+        self.ping.assert_not_called()
+
+    def test_manual_notification_requires_secrets(self):
+        del os.environ["TG_ADMIN_CHAT_ID"]
+        self.assertEqual(monitoring.main(["--test"]), 1)
+        self.notify.assert_not_called()
+        self.ping.assert_not_called()
+
+    def test_manual_notification_cannot_target_teaching_channel(self):
+        os.environ["TG_CHAT_ID"] = "123"
+        self.assertEqual(monitoring.main(["--test"]), 1)
+        self.notify.assert_not_called()
+
+    def test_manual_notification_failure_is_visible(self):
+        self.notify.return_value = False
+        self.assertEqual(monitoring.main(["--test"]), 1)
+        self.ping.assert_not_called()
+
     def test_failed_workflow_sends_notice_without_heartbeat(self):
         os.environ["WORKFLOW_STATUS"] = "failure"
         self.assertTrue(monitoring.report())
