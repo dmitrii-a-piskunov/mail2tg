@@ -45,7 +45,16 @@ jobs:
 
       - name: Установить зависимости
         # playwright нужен для скриншотов писем; сам браузер (Chrome) в GitHub уже установлен
-        run: pip install --quiet requests playwright
+        run: python -m pip install --quiet -r requirements.txt
+
+      - name: Проверить зависимости
+        run: python -m pip check
+
+      - name: Проверить код перед пересылкой
+        run: |
+          python -m py_compile mail2tg.py monitoring.py
+          python -c "import requests; from playwright.sync_api import sync_playwright"
+          python -B -m unittest discover -s tests -v
 
       - name: Переслать новые письма
         run: python3 mail2tg.py

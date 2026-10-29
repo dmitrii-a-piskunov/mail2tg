@@ -1,0 +1,37 @@
+name: Тесты
+
+on:
+  push:
+    paths:
+      - "**/*.py"
+      - "requirements.txt"
+      - ".github/workflows/*.yml"
+  pull_request:
+    paths:
+      - "**/*.py"
+      - "requirements.txt"
+      - ".github/workflows/*.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Установить зависимости
+        run: python -m pip install --quiet -r requirements.txt
+      - name: Проверить зависимости
+        run: python -m pip check
+      - name: Проверить синтаксис и импорты библиотек
+        run: |
+          python -m py_compile mail2tg.py monitoring.py
+          python -c "import requests; from playwright.sync_api import sync_playwright"
+      - name: Запустить тесты без почты и Telegram
+        run: python -B -m unittest discover -s tests -v
