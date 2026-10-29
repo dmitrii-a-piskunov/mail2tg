@@ -2,9 +2,16 @@
   "uidvalidity": 1788780658,
   "last_uid": 21,
   "failed": {
-    "live": {}
+    "live": {},
+    "history:01-Sep-2026": {}
   },
   "deliveries": {
-    "live": {}
+    "live": {},
+    "history:01-Sep-2026": {}
+  },
+  "backfill": {
+    "since": "01-Sep-2026",
+    "last_uid": 9,
+    "end_uid": 21
   }
 }
