@@ -132,6 +132,61 @@ class MonitoringTests(unittest.TestCase):
             response.read.return_value = b"OK"
             self.assertTrue(monitoring.heartbeat())
 
+    def test_heartbeat_posts_without_payload_and_confirms_success(self):
+        self.pinger.stop()
+        os.environ["HEALTHCHECK_URL"] = "https://hc-ping.com/private-check"
+        response = MagicMock()
+        response.status = 200
+        response.read.return_value = b"OK"
+        response.__enter__.return_value = response
+        with patch.object(monitoring, "urlopen", return_value=response) as sender, \
+                patch("builtins.print") as output:
+            self.assertTrue(monitoring.heartbeat())
+        request = sender.call_args.args[0]
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(request.data, b"")
+        self.assertEqual(sender.call_args.kwargs["timeout"], 15)
+        output.assert_called_once_with(
+            "Эндпоинт мониторинга ответил успешно; регистрацию сигнала проверяйте в истории монитора.")
+
+    def test_cronbox_uses_http_status_without_assuming_response_body(self):
+        self.pinger.stop()
+        os.environ["HEALTHCHECK_URL"] = "https://api.cronbox.ru/ping/private-token"
+        response = MagicMock()
+        response.status = 200
+        response.__enter__.return_value = response
+        with patch.object(monitoring, "urlopen", return_value=response) as sender:
+            self.assertTrue(monitoring.heartbeat())
+            self.assertEqual(sender.call_args.args[0].get_method(), "POST")
+            response.read.assert_not_called()
+            response.status = 503
+            self.assertFalse(monitoring.heartbeat())
+
+    def test_cronbox_lookalike_does_not_bypass_acknowledgement(self):
+        self.pinger.stop()
+        os.environ["HEALTHCHECK_URL"] = "https://api.cronbox.ru.example.org/ping/private-token"
+        response = MagicMock()
+        response.status = 200
+        response.read.return_value = b"not accepted"
+        response.__enter__.return_value = response
+        with patch.object(monitoring, "urlopen", return_value=response):
+            self.assertFalse(monitoring.heartbeat())
+
+    def test_heartbeat_transport_error_does_not_leak_url(self):
+        self.pinger.stop()
+        os.environ["HEALTHCHECK_URL"] = "https://hc-ping.com/private-check"
+        with patch.object(monitoring, "urlopen", side_effect=OSError("private-check")), \
+                patch("builtins.print") as output:
+            self.assertFalse(monitoring.heartbeat())
+        self.assertNotIn("private-check", str(output.call_args_list))
+
+    def test_heartbeat_rejects_insecure_url_without_request(self):
+        self.pinger.stop()
+        os.environ["HEALTHCHECK_URL"] = "http://hc-ping.com/private-check"
+        with patch.object(monitoring, "urlopen") as sender:
+            self.assertFalse(monitoring.heartbeat())
+        sender.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

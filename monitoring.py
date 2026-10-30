@@ -5,6 +5,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -72,12 +73,15 @@ def heartbeat():
     try:
         if not url.startswith("https://"):
             raise ValueError("HTTPS required")
+        endpoint = urlsplit(url)
+        cronbox = endpoint.hostname == "api.cronbox.ru" and endpoint.path.startswith("/ping/")
         with urlopen(Request(url, data=b"", method="POST"), timeout=15) as response:
-            if response.status != 200 or response.read(100).strip() != b"OK":
+            if response.status != 200 or (not cronbox and response.read(100).strip() != b"OK"):
                 raise ValueError("Heartbeat rejected")
     except Exception as err:
         print(f"Не удалось отправить сигнал мониторингу: {type(err).__name__}.")
         return False
+    print("Эндпоинт мониторинга ответил успешно; регистрацию сигнала проверяйте в истории монитора.")
     return True
 
 
